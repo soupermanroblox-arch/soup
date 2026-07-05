@@ -5,6 +5,8 @@ from discord import app_commands
 from discord.ext import commands
 import sqlite3
 from typing import Literal
+from flask import Flask
+from threading import Thread
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -15,6 +17,18 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 TOKEN = os.getenv("TOKEN")
+
+app = Flask(name)
+
+@app.route("/")
+def home():
+    return "Bot online"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+Thread(target=run_web, daemon=True).start()
 
 connection = sqlite3.connect("duelist.db")
 cursor = connection.cursor()
