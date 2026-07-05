@@ -18,17 +18,16 @@ tree = app_commands.CommandTree(client)
 
 TOKEN = os.getenv("TOKEN")
 
-app = Flask(name)
-
-@app.route("/")
+# ───────────── Keep‑alive server ─────────────
+app = Flask(__name__)
+@app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "Bot online"
+    return "Bot is running!", 200
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-Thread(target=run_web, daemon=True).start()
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
+threading.Thread(target=run_flask, daemon=True).start()
 
 connection = sqlite3.connect("duelist.db")
 cursor = connection.cursor()
