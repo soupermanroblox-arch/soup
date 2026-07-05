@@ -6,9 +6,9 @@ from discord.ext import commands
 import sqlite3
 from typing import Literal
 
-intents = discord.Intents.all()
-
+intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 client = discord.Client(intents=intents)
 
@@ -41,7 +41,7 @@ async def on_member_join(member):
 @client.event
 async def on_message(ctx):
     if(ctx.author.id == 1286730886074597389):
-        if(ctx == "say it"):
+        if ctx.content == "say it":
             logschannel = await client.fetch_channel(logschannelID) 
             await logschannel.send("soup is the GOAT!!!!! :fire:")
 @tree.command(
@@ -431,9 +431,9 @@ def elo_rating(Ra, Rb, K, outcome):
     # Update the Elo Ratings
 	
     if Ra < 20:
-        Ra == 20
+        Ra = 20
     if Rb < 20:
-        Rb == 20
+        Rb = 20
     return(Ra, Rb)
     # Print updated ratings
     print("Updated Ratings:-")
