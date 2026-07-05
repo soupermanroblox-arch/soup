@@ -3,10 +3,10 @@ import os
 import math
 from discord import app_commands
 from discord.ext import commands
+import threading
 import sqlite3
 from typing import Literal
 from flask import Flask
-from threading import Thread
 
 intents = discord.Intents.default()
 intents.message_content = True
