@@ -14,7 +14,7 @@ from flask import Flask
 # CONFIG
 # ============================================================
 
-TOKEN = os.environ.get("")
+TOKEN = os.environ.get("TOKEN")
 
 SERVER_ID = 1490855505000796262
 LOGS_CHANNEL_ID = 1513934803412713592
