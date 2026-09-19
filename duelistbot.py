@@ -1,455 +1,861 @@
 import discord
 import os
 import math
+import sqlite3
+import threading
+
 from discord import app_commands
 from discord.ext import commands
-import threading
-import sqlite3
 from typing import Literal
 from flask import Flask
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TOKEN = os.environ.get("")
+
+SERVER_ID = 1490855505000796262
+LOGS_CHANNEL_ID = 1513934803412713592
+
+MODERATOR_ROLE_NAME = "Duelist Moderator"
+
+# ELO system
+K = 75
+
+# Automatic ELO roles
+ELO_ROLES = {
+    "Unranked": (0, 399),
+    "C-Tier": (400, 799),
+    "B-Tier": (800, 1199),
+    "A-Tier": (1200, 1599),
+    "Quasi-S-Tier": (1600, 1999),
+    "Probationary S-Tier": (2000, 2399),
+    "S-Tier": (2400, 2799),
+}
+
+# These are manually awarded and are NOT controlled by ELO.
+PERMANENT_TIER_ROLES = {
+    "SS-Tier",
+    "SSS-Tier",
+}
+
+
+# ============================================================
+# DISCORD SETUP
+# ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 client = discord.Client(intents=intents)
-
 tree = app_commands.CommandTree(client)
 
-TOKEN = os.getenv("TOKEN")
 
-# ───────────── Keep‑alive server ─────────────
+# ============================================================
+# DATABASE
+# ============================================================
+
+connection = sqlite3.connect("duelist.db")
+cursor = connection.cursor()
+
+
+def create_database():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS UserData (
+            discordID INTEGER PRIMARY KEY,
+            elo INTEGER NOT NULL DEFAULT 400
+        )
+    """)
+    connection.commit()
+
+
+def get_elo(member_id):
+    cursor.execute(
+        "SELECT elo FROM UserData WHERE discordID = ?",
+        (member_id,)
+    )
+
+    result = cursor.fetchone()
+
+    if result is None:
+        cursor.execute(
+            "INSERT INTO UserData (discordID, elo) VALUES (?, ?)",
+            (member_id, 400)
+        )
+        connection.commit()
+        return 400
+
+    return result[0]
+
+
+def set_elo(member_id, elo):
+    elo = max(0, int(elo))
+
+    cursor.execute(
+        "INSERT INTO UserData (discordID, elo) VALUES (?, ?) "
+        "ON CONFLICT(discordID) DO UPDATE SET elo = excluded.elo",
+        (member_id, elo)
+    )
+
+    connection.commit()
+
+
+# ============================================================
+# KEEP-ALIVE SERVER
+# ============================================================
+
 app = Flask(__name__)
+
+
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return "Bot is running!", 200
 
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
+
+
 threading.Thread(target=run_flask, daemon=True).start()
 
-connection = sqlite3.connect("duelist.db")
-cursor = connection.cursor()
-role = None
 
-serverID = 1490855505000796262  # if its a new server, put it in here
-logschannelID = 1513934803412713592 # same with logs channel id 
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-@client.event
-async def on_ready():
-    print(f'{client.user} has connected to discord.')
-    cursor.execute("CREATE TABLE IF NOT EXISTS UserData (discordID INTEGER, elo INTEGER)")
-    connection.commit()
-    await tree.sync(guild=discord.Object(id=serverID))
-
-@client.event
-async def on_member_join(member):
-    cursor.execute(f'SELECT discordID FROM UserData WHERE discordID = {member.id};')
-    MemberExists = cursor.fetchone()
-    if MemberExists == None:
-        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 400)')
-        connection.commit()
-        
-@client.event
-async def on_message(ctx):
-    if(ctx.author.id == 1286730886074597389):
-        if ctx.content == "say it":
-            logschannel = await client.fetch_channel(logschannelID) 
-            await logschannel.send("soup is the GOAT!!!!! :fire:")
-@tree.command(
-    name = "elo_set",
-    description = "Set the elo of a user.",
-    guild = discord.Object(id=serverID))
-async def setelo(ctx, member: discord.Member, elo: int):
-    logschannel = await client.fetch_channel(logschannelID)
-    role = discord.utils.get(ctx.guild.roles, name = "Duelist Moderator")
-    if role in ctx.user.roles:
-        cursor.execute(f'UPDATE UserData SET elo = {elo} WHERE discordID = {member.id};')
-        connection.commit()
-        await updateRoles(ctx, member)
-        embedVar = discord.Embed(title = f"{member.display_name}'s points have been set.", description = f"<@{ctx.user.id}> set <@{member.id}>'s points to {elo}.")
-        await ctx.response.send_message(embed=embedVar)
-        await logschannel.send(embed=embedVar)
-
-@tree.command(
-    name = "elo_add",
-    description = "Add elo to a user.",
-    guild = discord.Object (id=serverID))
-async def addelo(ctx, member: discord.Member, elo: int):
-    logschannel = await client.fetch_channel(logschannelID)
-    role = discord.utils.get(ctx.guild.roles, name = "Duelist Moderator")
-    if role in ctx.user.roles:
-        cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {member.id};')
-        userElo = cursor.fetchone()
-        eloIncrease = userElo[0] + elo
-        cursor.execute(f'UPDATE UserData SET elo = {eloIncrease} WHERE discordID = {member.id};')
-        connection.commit()
-        await updateRoles(ctx, member)
-        embedVar = discord.Embed(title = f"{member.display_name}'s points have been updated.", description = f"<@{ctx.user.id}> has added {elo} to <@{member.id}>'s elo.")
-        await ctx.response.send_message(embed=embedVar)
-        await logschannel.send(embed=embedVar)
+def get_role(guild, role_name):
+    return discord.utils.get(guild.roles, name=role_name)
 
 
-@tree.command(
-    name = "elo_remove",
-    description = "Remove elo from a user.",
-    guild = discord.Object(id=serverID))
-async def removelo(ctx, member: discord.Member, elo: int):
-    logschannel = await client.fetch_channel(logschannelID)
-    role = discord.utils.get(ctx.guild.roles, name = "Duelist Moderator")
-    if role in ctx.user.roles:
-        cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {member.id};')
-        userElo = cursor.fetchone()
-        eloDecrease = userElo[0] - elo
-        cursor.execute(f'UPDATE UserData SET elo = {eloDecrease} WHERE discordID = {member.id};')
-        connection.commit()
-        await updateRoles(ctx, member)
-        embedVar = discord.Embed(title = f"{member.display_name}'s points have been updated.", description = f"<@{ctx.user.id}> has removed {elo} from <@{member.id}>'s elo.")
-        await ctx.response.send_message(embed=embedVar)
-        await logschannel.send(embed=embedVar)
+def has_moderator_role(member):
+    role = get_role(member.guild, MODERATOR_ROLE_NAME)
 
-@tree.command(
-    name = "elo_check",
-    description = "Check your elo or another users elo.",
-    guild = discord.Object(id=serverID))
-async def elocheck(ctx, member: discord.Member = None):
-    if member == None:
-        member = ctx.user
-    userElo = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {member.id};')
-    userElo = cursor.fetchone()
-    await updateRoles(ctx, member)
-    embedVar = discord.Embed(title = f"{member.display_name}'s Elo", description = f"<@{member.id}> has an elo of {userElo[0]}.")
-    await ctx.response.send_message(embed=embedVar)
+    if role is None:
+        return False
+
+    return role in member.roles
 
 
-K = 110
+async def get_logs_channel():
+    try:
+        return await client.fetch_channel(LOGS_CHANNEL_ID)
+    except discord.NotFound:
+        return None
+    except discord.Forbidden:
+        return None
+    except discord.HTTPException:
+        return None
 
-@tree.command(
-    name = "submit_match",
-    description = "Submit a match for an overview by duelist moderators.",
-    guild = discord.Object(id=serverID))
-async def submit(ctx, winner: discord.Member, loser: discord.Member, proof: discord.Attachment):
-    role = discord.utils.get(ctx.guild.roles, name = "Duelist Moderator")
-    logschannel = await client.fetch_channel(logschannelID)
-    if role in ctx.user.roles:
-        WinnerRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {winner.id};')
-        WinnerRating = cursor.fetchone()
-        LoserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {loser.id};')
-        LoserRating = cursor.fetchone()
-        WinnerElo, LoserElo = elo_rating(WinnerRating[0], LoserRating[0], K, 1)
-        cursor.execute(f'UPDATE UserData SET elo = {WinnerElo} WHERE discordID = {winner.id};')
-        cursor.execute(f'UPDATE UserData SET elo = {LoserElo} WHERE discordID = {loser.id};')
-        connection.commit()
-        WinnerRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {winner.id};')
-        WinnerRating = cursor.fetchone()
-        LoserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {loser.id};')
-        LoserRating = cursor.fetchone()
 
-        embedVar = discord.Embed(title = f"{winner.display_name} VS {loser.display_name}", description = f"A duel has concluded. \n \n Winner: {winner.display_name} - New Elo: {WinnerRating[0]} \n Loser: {loser.display_name} - New Elo: {LoserRating[0]} \n \n Proof can be seen below.")
-        embedVar.set_image(url = proof.url)
-        await ctx.response.send_message(embed=embedVar)
-        await updateranksets(ctx, winner, loser)
-        await logschannel.send(embed=embedVar)
+def get_automatic_role_name(elo):
+    if elo >= 2400:
+        return "S-Tier"
 
-@tree.command(
-    name = "submit_tiered_match",
-    description = "Submit a tiered match for an overview by duelist moderators.",
-    guild = discord.Object(id=serverID))
-async def tieredsubmit(ctx, winner: discord.Member, loser: discord.Member, proof: discord.Attachment, challengerstatus: Literal["Challenger Won", "Challenger Lost"]):
-    role = discord.utils.get(ctx.guild.roles, name = "Duelist Moderator")
-    logschannel = await client.fetch_channel(logschannelID)
-    if role in ctx.user.roles:
-        if challengerstatus == "Challenger Won":
-            UnrankedRole = discord.utils.get(ctx.guild.roles, name = "Unranked")
-            NoviceRole = discord.utils.get(ctx.guild.roles, name = "C-Tier")
-            PracticionerRole = discord.utils.get(ctx.guild.roles, name = "B-Tier")
-            QuasiRole = discord.utils.get(ctx.guild.roles, name = "Quasi-Elite")
-            AtierRole = discord.utils.get(ctx.guild.roles, name = "A-Tier")
-            if QuasiRole in loser.roles:
-                cursor.execute(f'UPDATE UserData SET elo = {1850} WHERE discordID = {winner.id};')
-            elif AtierRole in loser.roles:
-                cursor.execute(f'UPDATE UserData SET elo = {1450} WHERE discordID = {winner.id};')
-            elif PracticionerRole in loser.roles:
-                cursor.execute(f'UPDATE UserData SET elo = {1050} WHERE discordID = {winner.id};')
-            elif NoviceRole in loser.roles:
-                cursor.execute(f'UPDATE UserData SET elo = {750} WHERE discordID = {winner.id};')
-            LoserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {loser.id};')
-            LoserRating = cursor.fetchone()
-            newLoserElo = LoserRating[0] - 250
-            cursor.execute(f'UPDATE UserData SET elo = {newLoserElo} WHERE discordID = {loser.id};')
-            connection.commit()
-        elif challengerstatus == "Challenger Lost":
-            WinnerRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {winner.id};')
-            WinnerRating = cursor.fetchone()
-            LoserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {loser.id};')
-            LoserRating = cursor.fetchone()
-            WinnerElo, LoserElo = elo_rating(WinnerRating[0], LoserRating[0], K, 1)
-            cursor.execute(f'UPDATE UserData SET elo = {WinnerElo} WHERE discordID = {winner.id};')
-            cursor.execute(f'UPDATE UserData SET elo = {LoserElo} WHERE discordID = {loser.id};')
-            connection.commit()
+    if elo >= 2000:
+        return "Probationary S-Tier"
 
-            
-        WinnerRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {winner.id};')
-        WinnerRating = cursor.fetchone()
-        LoserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {loser.id};')
-        LoserRating = cursor.fetchone()
-        embedVar = discord.Embed(title = f"{winner.display_name} VS {loser.display_name} [TIERED]", description = f"A duel has concluded. \n \n Winner: {winner.display_name} - New Elo: {WinnerRating[0]} \n Loser: {loser.display_name} - New Elo: {LoserRating[0]} \n \n Proof can be seen below.")
-        embedVar.set_image(url = proof.url)
-        await ctx.response.send_message(embed=embedVar)
-        await updateranksets(ctx, winner, loser)
-        await logschannel.send(embed=embedVar)
+    if elo >= 1600:
+        return "Quasi-S-Tier"
 
-        
-async def updateranksets(ctx, winner, loser):
-    await updateRoles(ctx, winner)
-    await updateRoles(ctx, loser)
-@tree.command(
-    name = "check_leaderboard",
-    description = "Check the current standings!",
-    guild = discord.Object(id=serverID))
-async def showleaderboard(ctx):
-    embedVar = discord.Embed(title = "Current Leaderboard Rankings")
-    Leaderboard = cursor.execute(f'SELECT elo, discordID FROM UserData ORDER BY elo DESC;')
-    Leaderboard = cursor.fetchall()
-    for value in range(10):
-        embedVar.add_field(name = f"#{value + 1}", value = f"<@{Leaderboard[value][1]}> - {Leaderboard[value][0]}", inline = False)
-    await ctx.response.send_message(embed=embedVar)
+    if elo >= 1200:
+        return "A-Tier"
 
-@tree.command(
-    name = "update_user",
-    description = "Update user role according to elo.",
-    guild = discord.Object(id=serverID)
-)
-async def updateuser(ctx, member: discord.Member):
-    await updateRoles(ctx, member)
-    await ctx.response.send_message("Updated user roles.")
-    
-        
-#@tree.command(
-#    name = "update_users",
-#    description = "Update all users to the original elo/rank match.",
-#    guild = discord.Object(id=serverID))
-#async def updateusers(ctx):
-##    role = discord.utils.get(ctx.guild.roles, name = "big z")
- #   if role in ctx.user.roles:
-  #      duelistGuild = client.get_guild(serverID)
-   #     UnrankedRole = discord.utils.get(ctx.guild.roles, name = "Unranked")
-    #    NoviceRole = discord.utils.get(ctx.guild.roles, name = "Novice")
-     #   PracticionerRole = discord.utils.get(ctx.guild.roles, name = "Practitioner")
-      #  QuasiRole = discord.utils.get(ctx.guild.roles, name = "Quasi-Elite")
-       # ProbationaryRole = discord.utils.get(ctx.guild.roles, name = "Probationary Elite")
-        #EliteRole = discord.utils.get(ctx.guild.roles, name = "Elite")
-        #HighEliteRole = discord.utils.get(ctx.guild.roles, name = "High Elite")
-        #GrandmasterRole = discord.utils.get(ctx.guild.roles, name = "Grandmaster")
-        #for member in duelistGuild.members:
-        #    if GrandmasterRole in member.roles:
-        #        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 2801)')
-        #        connection.commit()
-        #    elif HighEliteRole in member.roles:
-        #        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 2400)')
-        #        connection.commit()
-        #    elif EliteRole in member.roles:
-        #        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 2001)')
-        #        connection.commit()
-        #    elif ProbationaryRole in member.roles:
-        #        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 1501)')
-        #        connection.commit()
-        #    elif QuasiRole in member.roles:
-        #        cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 1001)')
-         #       connection.commit()
-         #   elif PracticionerRole in member.roles:
-         #       cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 1000)')
-         #       connection.commit()
-         #   elif NoviceRole in member.roles:
-         #       cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 601)')
-         #       connection.commit()
-         #   elif UnrankedRole in member.roles:
-         #       cursor.execute(f'INSERT INTO UserData VALUES({member.id}, 0)')
-        #print("Update done.")
+    if elo >= 800:
+        return "B-Tier"
+
+    if elo >= 400:
+        return "C-Tier"
+
+    return "Unranked"
+
 
 async def updateRoles(ctx, user):
-    UserRating = cursor.execute(f'SELECT elo FROM UserData WHERE discordID = {user.id};')
-    UserRating = cursor.fetchone()
-    NoviceRole = discord.utils.get(ctx.guild.roles, name = "C-Tier")
-    PracticionerRole = discord.utils.get(ctx.guild.roles, name = "B-Tier")
-    QuasiRole = discord.utils.get(ctx.guild.roles, name = "Quasi-S-Tier")
-    ProbationaryRole = discord.utils.get(ctx.guild.roles, name = "Probationary S-Tier")
-    EliteRole = discord.utils.get(ctx.guild.roles, name = "S-Tier")
-    HighEliteRole = discord.utils.get(ctx.guild.roles, name = "SS-Tier")
-    GrandmasterRole = discord.utils.get(ctx.guild.roles, name = "SSS-Tier")
-    AtierRole = discord.utils.get(ctx.guild.roles, name = "A-Tier")
-    if(UserRating[0] >= 2800):
-        if HighEliteRole in user.roles:
-            if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-            if EliteRole in user.roles:
-                await user.remove_roles(EliteRole)
-            if ProbationaryRole in user.roles:
-                await user.remove_roles(ProbationaryRole)
-            if QuasiRole in user.roles:
-                await user.remove_roles(QuasiRole)
-            if PracticionerRole in user.roles:
-                await user.remove_roles(PracticionerRole)
-            if NoviceRole in user.roles:
-                await user.remove_roles(NoviceRole)
-            if UnrankedRole in user.roles:
-                await user.remove_roles(UnrankedRole)
-            await user.add_roles(GrandmasterRole)
-    elif(UserRating[0] >= 2400):
-        if EliteRole in user.roles:
-            await user.add_roles(HighEliteRole)
-            if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-            if EliteRole in user.roles:
-                await user.remove_roles(EliteRole)
-            if ProbationaryRole in user.roles:
-                await user.remove_roles(ProbationaryRole)
-            if QuasiRole in user.roles:
-                await user.remove_roles(QuasiRole)
-            if PracticionerRole in user.roles:
-                await user.remove_roles(PracticionerRole)
-            if NoviceRole in user.roles:
-                await user.remove_roles(NoviceRole)
-            if UnrankedRole in user.roles:
-                await user.remove_roles(UnrankedRole)
-            if GrandmasterRole in user.roles:
-                await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 2001):
-        if EliteRole not in user.roles:
-            await user.add_roles(ProbationaryRole)
-            if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-            if QuasiRole in user.roles:
-                await user.remove_roles(QuasiRole)
-            if PracticionerRole in user.roles:
-                await user.remove_roles(PracticionerRole)
-            if NoviceRole in user.roles:
-                await user.remove_roles(NoviceRole)
-            if UnrankedRole in user.roles:
-                await user.remove_roles(UnrankedRole)
-            if GrandmasterRole in user.roles:
-                await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 1501):
-        if EliteRole in user.roles:
-        	await user.remove_roles(EliteRole)
-        if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-        if ProbationaryRole in user.roles:
-        	await user.remove_roles(ProbationaryRole)
-        await user.add_roles(QuasiRole)
-        if PracticionerRole in user.roles:
-            await user.remove_roles(PracticionerRole)
-        if NoviceRole in user.roles:
-            await user.remove_roles(NoviceRole)
-        if UnrankedRole in user.roles:
-            await user.remove_roles(UnrankedRole)
-        if GrandmasterRole in user.roles:
-            await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 1001):
-        if EliteRole in user.roles:
-        	await user.remove_roles(EliteRole)
-        if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-        if ProbationaryRole in user.roles:
-        	await user.remove_roles(ProbationaryRole)
-        if QuasiRole in user.roles:
-        	await user.remove_roles(QuasiRole)
-        await user.add_roles(AtierRole)
-        if PracticionerRole in user.roles:
-            await user.remove_roles(PracticionerRole)
-        if NoviceRole in user.roles:
-            await user.remove_roles(NoviceRole)
-        if UnrankedRole in user.roles:
-            await user.remove_roles(UnrankedRole)
-        if GrandmasterRole in user.roles:
-            await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 601):
-        if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-        if EliteRole in user.roles:
-        	await user.remove_roles(EliteRole)
-        if ProbationaryRole in user.roles:
-        	await user.remove_roles(ProbationaryRole)
-        if QuasiRole in user.roles:
-        	await user.remove_roles(QuasiRole)
-        await user.add_roles(PracticionerRole)
-        if NoviceRole in user.roles:
-            await user.remove_roles(NoviceRole)
-        if UnrankedRole in user.roles:
-            await user.remove_roles(UnrankedRole)
-        if GrandmasterRole in user.roles:
-            await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 301):
-        if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-        if EliteRole in user.roles:
-        	await user.remove_roles(EliteRole)
-        if ProbationaryRole in user.roles:
-        	await user.remove_roles(ProbationaryRole)
-        if QuasiRole in user.roles:
-        	await user.remove_roles(QuasiRole)
-        if PracticionerRole in user.roles:
-            await user.remove_roles(PracticionerRole)
-        await user.add_roles(NoviceRole)
-        if UnrankedRole in user.roles:
-            await user.remove_roles(UnrankedRole)
-        if GrandmasterRole in user.roles:
-            await user.remove_roles(GrandmasterRole)
-    elif(UserRating[0] >= 0):
-        if HighEliteRole in user.roles:
-                await user.remove_roles(HighEliteRole)
-        if EliteRole in user.roles:
-        	await user.remove_roles(EliteRole)
-        if ProbationaryRole in user.roles:
-        	await user.remove_roles(ProbationaryRole)
-        if QuasiRole in user.roles:
-        	await user.remove_roles(QuasiRole)
-        if PracticionerRole in user.roles:
-            await user.remove_roles(PracticionerRole)
-        if NoviceRole in user.roles:
-            await user.remove_roles(NoviceRole)
-        await user.add_roles(UnrankedRole)
-        if GrandmasterRole in user.roles:
-            await user.remove_roles(GrandmasterRole)
-        
-        
+    """
+    Updates a user's automatic ELO rank.
+
+    SS-Tier and SSS-Tier are manually awarded ranks and are
+    intentionally preserved regardless of ELO.
+
+    If a user has SS-Tier or SSS-Tier, their automatic rank
+    will not be changed.
+    """
+
+    if user is None or ctx.guild is None:
+        return
+
+    user_elo = get_elo(user.id)
+
+    # --------------------------------------------------------
+    # Preserve manually awarded SS / SSS ranks
+    # --------------------------------------------------------
+
+    sss_role = get_role(ctx.guild, "SSS-Tier")
+    ss_role = get_role(ctx.guild, "SS-Tier")
+
+    if (
+        (sss_role is not None and sss_role in user.roles)
+        or
+        (ss_role is not None and ss_role in user.roles)
+    ):
+        # Remove all automatic ELO roles so the manually
+        # awarded SS/SSS rank is the only tier role.
+        for role_name in ELO_ROLES:
+            role = get_role(ctx.guild, role_name)
+
+            if role is not None and role in user.roles:
+                try:
+                    await user.remove_roles(role)
+                except discord.HTTPException:
+                    pass
+
+        return
+
+    # --------------------------------------------------------
+    # Determine automatic role
+    # --------------------------------------------------------
+
+    automatic_role_name = get_automatic_role_name(user_elo)
+    automatic_role = get_role(ctx.guild, automatic_role_name)
+
+    if automatic_role is None:
+        print(
+            f"WARNING: Could not find Discord role "
+            f"'{automatic_role_name}'."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Remove other automatic ELO roles
+    # --------------------------------------------------------
+
+    for role_name in ELO_ROLES:
+        role = get_role(ctx.guild, role_name)
+
+        if role is not None and role != automatic_role:
+            if role in user.roles:
+                try:
+                    await user.remove_roles(role)
+                except discord.HTTPException as error:
+                    print(
+                        f"Could not remove {role_name} from "
+                        f"{user}: {error}"
+                    )
+
+    # --------------------------------------------------------
+    # Add correct role
+    # --------------------------------------------------------
+
+    if automatic_role not in user.roles:
+        try:
+            await user.add_roles(automatic_role)
+        except discord.HTTPException as error:
+            print(
+                f"Could not add {automatic_role_name} to "
+                f"{user}: {error}"
+            )
+
+
+async def update_rank_sets(ctx, winner, loser):
+    await updateRoles(ctx, winner)
+    await updateRoles(ctx, loser)
+
+
 def probability(rating1, rating2):
-    return 1.0 / (1 + math.pow(10, (rating1 - rating2) / 1500.0))
+    return 1.0 / (
+        1 + math.pow(10, (rating1 - rating2) / 1500.0)
+    )
 
 
 def elo_rating(Ra, Rb, K, outcome):
+    """
+    Calculates the new ELO ratings.
+
+    outcome:
+        1 = Player A wins
+        0 = Player B wins
+    """
 
     Pb = probability(Ra, Rb)
-
-    # Calculate the Winning Probability of Player A
     Pa = probability(Rb, Ra)
 
     rating_diff = abs(Ra - Rb)
     multiplier = pow(1.05, rating_diff // 100)
 
     if Ra < Rb:
-        underdog = 'player1'
+        underdog = "player1"
     elif Rb < Ra:
-        underdog = 'player2'
+        underdog = "player2"
     else:
         underdog = None
-    
-    if underdog == 'player1':
-        Ra = round(Ra + (K * multiplier) * (outcome - Pa))
-        Rb = round(Rb + (K * multiplier) * ((1 - outcome) - Pb))
+
+    if underdog == "player1":
+        Ra = round(
+            Ra + (K * multiplier) * (outcome - Pa)
+        )
+
+        Rb = round(
+            Rb + (K * multiplier) * ((1 - outcome) - Pb)
+        )
+
     else:
-        Ra = round(Ra + K * (outcome - Pa))
-        Rb = round(Rb + K * ((1 - outcome) - Pb))                   
-    # Update the Elo Ratings
-	
-    if Ra < 20:
-        Ra = 20
-    if Rb < 20:
-        Rb = 20
-    return(Ra, Rb)
-    # Print updated ratings
-    print("Updated Ratings:-")
-    print(f"Ra = {Ra} Rb = {Rb}")
+        Ra = round(
+            Ra + K * (outcome - Pa)
+        )
+
+        Rb = round(
+            Rb + K * ((1 - outcome) - Pb)
+        )
+
+    # ELO cannot go below 0.
+    Ra = max(0, Ra)
+    Rb = max(0, Rb)
+
+    return Ra, Rb
+
+
+# ============================================================
+# BOT EVENTS
+# ============================================================
+
+@client.event
+async def on_ready():
+    create_database()
+
+    print(f"{client.user} has connected to Discord.")
+
+    guild = discord.Object(id=SERVER_ID)
+
+    try:
+        await tree.sync(guild=guild)
+        print("Slash commands synced.")
+    except discord.HTTPException as error:
+        print(f"Failed to sync slash commands: {error}")
+
+
+@client.event
+async def on_member_join(member):
+    # New members start at 400 ELO.
+    # Therefore they immediately receive C-Tier.
+    get_elo(member.id)
+
+    await updateRoles(
+        type(
+            "Context",
+            (),
+            {"guild": member.guild}
+        )(),
+        member
+    )
+
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.author.id == 1286730886074597389:
+        if message.content == "say it":
+            logs_channel = await get_logs_channel()
+
+            if logs_channel:
+                await logs_channel.send(
+                    "soup is the GOAT!!!!! :fire:"
+                )
+
+    await client.process_commands(message)
+
+
+# ============================================================
+# /elo_set
+# ============================================================
+
+@tree.command(
+    name="elo_set",
+    description="Set the ELO of a user.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    member="The user whose ELO you want to set.",
+    elo="The new ELO."
+)
+async def setelo(
+    ctx: discord.Interaction,
+    member: discord.Member,
+    elo: int
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    elo = max(0, elo)
+
+    set_elo(member.id, elo)
+
+    await updateRoles(ctx, member)
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s ELO has been set.",
+        description=(
+            f"<@{ctx.user.id}> set "
+            f"<@{member.id}>'s ELO to **{elo}**."
+        )
+    )
+
+    await ctx.response.send_message(embed=embed)
+
+    logs_channel = await get_logs_channel()
+
+    if logs_channel:
+        await logs_channel.send(embed=embed)
+
+
+# ============================================================
+# /elo_add
+# ============================================================
+
+@tree.command(
+    name="elo_add",
+    description="Add ELO to a user.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    member="The user whose ELO you want to increase.",
+    elo="The amount of ELO to add."
+)
+async def addelo(
+    ctx: discord.Interaction,
+    member: discord.Member,
+    elo: int
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    if elo < 0:
+        await ctx.response.send_message(
+            "ELO amount cannot be negative.",
+            ephemeral=True
+        )
+        return
+
+    current_elo = get_elo(member.id)
+    new_elo = current_elo + elo
+
+    set_elo(member.id, new_elo)
+
+    await updateRoles(ctx, member)
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s ELO has been updated.",
+        description=(
+            f"<@{ctx.user.id}> added **{elo} ELO** to "
+            f"<@{member.id}>.\n\n"
+            f"Previous ELO: **{current_elo}**\n"
+            f"New ELO: **{new_elo}**"
+        )
+    )
+
+    await ctx.response.send_message(embed=embed)
+
+    logs_channel = await get_logs_channel()
+
+    if logs_channel:
+        await logs_channel.send(embed=embed)
+
+
+# ============================================================
+# /elo_remove
+# ============================================================
+
+@tree.command(
+    name="elo_remove",
+    description="Remove ELO from a user.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    member="The user whose ELO you want to decrease.",
+    elo="The amount of ELO to remove."
+)
+async def removelo(
+    ctx: discord.Interaction,
+    member: discord.Member,
+    elo: int
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    if elo < 0:
+        await ctx.response.send_message(
+            "ELO amount cannot be negative.",
+            ephemeral=True
+        )
+        return
+
+    current_elo = get_elo(member.id)
+    new_elo = max(0, current_elo - elo)
+
+    set_elo(member.id, new_elo)
+
+    await updateRoles(ctx, member)
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s ELO has been updated.",
+        description=(
+            f"<@{ctx.user.id}> removed **{elo} ELO** from "
+            f"<@{member.id}>.\n\n"
+            f"Previous ELO: **{current_elo}**\n"
+            f"New ELO: **{new_elo}**"
+        )
+    )
+
+    await ctx.response.send_message(embed=embed)
+
+    logs_channel = await get_logs_channel()
+
+    if logs_channel:
+        await logs_channel.send(embed=embed)
+
+
+# ============================================================
+# /elo_check
+# ============================================================
+
+@tree.command(
+    name="elo_check",
+    description="Check your ELO or another user's ELO.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    member="The user whose ELO you want to check."
+)
+async def elocheck(
+    ctx: discord.Interaction,
+    member: discord.Member = None
+):
+
+    if member is None:
+        member = ctx.user
+
+    user_elo = get_elo(member.id)
+
+    await updateRoles(ctx, member)
+
+    rank = get_automatic_role_name(user_elo)
+
+    # Display manually awarded ranks if applicable.
+    if get_role(ctx.guild, "SSS-Tier") in member.roles:
+        rank = "SSS-Tier"
+    elif get_role(ctx.guild, "SS-Tier") in member.roles:
+        rank = "SS-Tier"
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s ELO",
+        description=(
+            f"<@{member.id}> has an ELO of **{user_elo}**.\n"
+            f"Rank: **{rank}**"
+        )
+    )
+
+    await ctx.response.send_message(embed=embed)
+
+
+# ============================================================
+# /submit_match
+# ============================================================
+
+@tree.command(
+    name="submit_match",
+    description="Submit a match for an overview by Duelist Moderators.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    winner="The winner of the duel.",
+    loser="The loser of the duel.",
+    proof="Proof of the duel."
+)
+async def submit(
+    ctx: discord.Interaction,
+    winner: discord.Member,
+    loser: discord.Member,
+    proof: discord.Attachment
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    if winner.id == loser.id:
+        await ctx.response.send_message(
+            "The winner and loser cannot be the same person.",
+            ephemeral=True
+        )
+        return
+
+    winner_elo = get_elo(winner.id)
+    loser_elo = get_elo(loser.id)
+
+    new_winner_elo, new_loser_elo = elo_rating(
+        winner_elo,
+        loser_elo,
+        K,
+        1
+    )
+
+    set_elo(winner.id, new_winner_elo)
+    set_elo(loser.id, new_loser_elo)
+
+    await update_rank_sets(ctx, winner, loser)
+
+    embed = discord.Embed(
+        title=f"{winner.display_name} VS {loser.display_name}",
+        description=(
+            "A duel has concluded.\n\n"
+            f"Winner: {winner.display_name} "
+            f"- New ELO: **{new_winner_elo}**\n"
+            f"Loser: {loser.display_name} "
+            f"- New ELO: **{new_loser_elo}**\n\n"
+            "Proof can be seen below."
+        )
+    )
+
+    embed.set_image(url=proof.url)
+
+    await ctx.response.send_message(embed=embed)
+
+    logs_channel = await get_logs_channel()
+
+    if logs_channel:
+        await logs_channel.send(embed=embed)
+
+
+# ============================================================
+# /submit_tiered_match
+# ============================================================
+
+@tree.command(
+    name="submit_tiered_match",
+    description="Submit a tiered match for review.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    winner="The winner of the duel.",
+    loser="The loser of the duel.",
+    proof="Proof of the duel.",
+    challengerstatus="Whether the challenger won or lost."
+)
+async def tieredsubmit(
+    ctx: discord.Interaction,
+    winner: discord.Member,
+    loser: discord.Member,
+    proof: discord.Attachment,
+    challengerstatus: Literal[
+        "Challenger Won",
+        "Challenger Lost"
+    ]
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    if winner.id == loser.id:
+        await ctx.response.send_message(
+            "The winner and loser cannot be the same person.",
+            ephemeral=True
+        )
+        return
+
+    # --------------------------------------------------------
+    # Challenger WON
+    # --------------------------------------------------------
+
+    if challengerstatus == "Challenger Won":
+
+        loser_elo = get_elo(loser.id)
+
+        # Determine the loser's current automatic rank.
+        loser_rank = get_automatic_role_name(loser_elo)
+
+        # Existing tiered-match system:
+        # Winner is placed at a representative ELO based
+        # on the loser's tier.
+        placement_elo = {
+            "Quasi-S-Tier": 1850,
+            "A-Tier": 1450,
+            "B-Tier": 1050,
+            "C-Tier": 750,
+        }
+
+        if loser_rank in placement_elo:
+            set_elo(
+                winner.id,
+                placement_elo[loser_rank]
+            )
+
+        # Challenger who loses 250 ELO.
+        new_loser_elo = max(0, loser_elo - 250)
+
+        set_elo(loser.id, new_loser_elo)
+
+    # --------------------------------------------------------
+    # Challenger LOST
+    # --------------------------------------------------------
+
+    elif challengerstatus == "Challenger Lost":
+
+        winner_elo = get_elo(winner.id)
+        loser_elo = get_elo(loser.id)
+
+        new_winner_elo, new_loser_elo = elo_rating(
+            winner_elo,
+            loser_elo,
+            K,
+            1
+        )
+
+        set_elo(winner.id, new_winner_elo)
+        set_elo(loser.id, new_loser_elo)
+
+    # --------------------------------------------------------
+    # Update roles
+    # --------------------------------------------------------
+
+    await update_rank_sets(ctx, winner, loser)
+
+    winner_elo = get_elo(winner.id)
+    loser_elo = get_elo(loser.id)
+
+    embed = discord.Embed(
+        title=(
+            f"{winner.display_name} VS "
+            f"{loser.display_name} [TIERED]"
+        ),
+        description=(
+            "A tiered duel has concluded.\n\n"
+            f"Winner: {winner.display_name} "
+            f"- New ELO: **{winner_elo}**\n"
+            f"Loser: {loser.display_name} "
+            f"- New ELO: **{loser_elo}**\n\n"
+            "Proof can be seen below."
+        )
+    )
+
+    embed.set_image(url=proof.url)
+
+    await ctx.response.send_message(embed=embed)
+
+    logs_channel = await get_logs_channel()
+
+    if logs_channel:
+        await logs_channel.send(embed=embed)
+
+
+# ============================================================
+# /check_leaderboard
+# ============================================================
+
+@tree.command(
+    name="check_leaderboard",
+    description="Check the current standings!",
+    guild=discord.Object(id=SERVER_ID)
+)
+async def showleaderboard(ctx: discord.Interaction):
+
+    cursor.execute(
+        "SELECT elo, discordID "
+        "FROM UserData "
+        "ORDER BY elo DESC "
+        "LIMIT 10"
+    )
+
+    leaderboard = cursor.fetchall()
+
+    embed = discord.Embed(
+        title="Current Leaderboard Rankings"
+    )
+
+    if not leaderboard:
+        embed.description = "There are currently no ranked users."
+        await ctx.response.send_message(embed=embed)
+        return
+
+    for index, value in enumerate(leaderboard, start=1):
+        embed.add_field(
+            name=f"#{index}",
+            value=f"<@{value[1]}> - **{value[0]} ELO**",
+            inline=False
+        )
+
+    await ctx.response.send_message(embed=embed)
+
+
+# ============================================================
+# /update_user
+# ============================================================
+
+@tree.command(
+    name="update_user",
+    description="Update a user's role according to their ELO.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    member="The user whose role you want to update."
+)
+async def updateuser(
+    ctx: discord.Interaction,
+    member: discord.Member
+):
+
+    if not has_moderator_role(ctx.user):
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    await updateRoles(ctx, member)
+
+    await ctx.response.send_message(
+        f"Updated {member.mention}'s ELO role."
+    )
+
+
+# ============================================================
+# START BOT
+# ============================================================
+
+if not TOKEN:
+    raise RuntimeError(
+        "TOKEN environment variable is missing. "
+        "Add your Discord bot token as TOKEN in your hosting environment."
+    )
 
 client.run(TOKEN)
