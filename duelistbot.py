@@ -2423,8 +2423,9 @@ if not has_elo_set_permission(
     ctx.user
 ):
 
-        await deny(ctx)
-        return
+    await deny(ctx)
+    return
+
 
 
     if member.bot:
