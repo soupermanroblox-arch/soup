@@ -2419,14 +2419,12 @@ async def profile_reset(
     member: discord.Member
 ):
 
-if not has_elo_set_permission(
-    ctx.user
-):
+    if not has_elo_set_permission(
+        ctx.user
+    ):
 
-    await deny(ctx)
-    return
-
-
+        await deny(ctx)
+        return
 
     if member.bot:
 
@@ -2436,53 +2434,6 @@ if not has_elo_set_permission(
         )
 
         return
-
-
-    view = discord.ui.View(
-        timeout=30
-    )
-
-
-    async def check_user(
-        interaction
-    ):
-
-        if interaction.user.id != ctx.user.id:
-
-            await interaction.response.send_message(
-                "Only the staff member who started this reset can confirm it.",
-                ephemeral=True
-            )
-
-            return False
-
-
-        return True
-
-
-    view.interaction_check = check_user
-
-
-    confirm_button = discord.ui.Button(
-        label="Confirm Reset",
-        style=discord.ButtonStyle.danger
-    )
-
-
-    cancel_button = discord.ui.Button(
-        label="Cancel",
-        style=discord.ButtonStyle.secondary
-    )
-
-
-    async def confirm_callback(
-        interaction
-    ):
-
-        reset_time, old_elos = reset_profile(
-            member.id,
-            ctx.user.id
-        )
 
 
         # ----------------------------------------------------
