@@ -19,7 +19,8 @@ TOKEN = os.environ.get("TOKEN")
 SERVER_ID = 1490855505000796262
 LOGS_CHANNEL_ID = 1513934803412713592
 
-MODERATOR_ROLE_NAME = "Duelist Moderator"
+MODERATOR_ROLE_ID = 1490855600236789820
+CATEGORY_NOTIFICATION_CHANNEL_ID = 1551022906916470875
 
 # ELO system
 K = 75
@@ -40,6 +41,18 @@ PERMANENT_TIER_ROLES = {
     "SS-Tier",
     "SSS-Tier",
 }
+
+
+# Category roles
+CATEGORY_ROLES = {
+    1548316579425554513: "Gunner",
+    1548316920930115614: "Wielder",
+    1548316617320964206: "Swordsman",
+}
+
+# Moderator notification
+MODERATOR_ROLE_ID = 1490855600236789820
+CATEGORY_NOTIFICATION_CHANNEL_ID = 1551022906916470875
 
 
 # ============================================================
@@ -327,34 +340,180 @@ def elo_rating(Ra, Rb, K, outcome):
 # ============================================================
 
 @client.event
-async def on_ready():
-    create_database()
+async def on_member_update(before, after):
+    """
+    Detects when a duelist changes between:
+    Swordsman, Wielder, and Gunner.
 
-    print(f"{client.user} has connected to Discord.")
+    When their category changes:
+    - Their old category is removed.
+    - Their new category remains.
+    - All tier roles are removed.
+    - They receive Unranked.
+    - Their ELO stays unchanged.
+    - Duelist Moderator is pinged in the notification channel.
+    """
 
-    guild = discord.Object(id=SERVER_ID)
+    # --------------------------------------------------------
+    # Find category before the change
+    # --------------------------------------------------------
 
-    try:
-        await tree.sync(guild=guild)
-        print("Slash commands synced.")
-    except discord.HTTPException as error:
-        print(f"Failed to sync slash commands: {error}")
+    before_categories = [
+        role for role in before.roles
+        if role.id in CATEGORY_ROLES
+    ]
 
+    # --------------------------------------------------------
+    # Find category after the change
+    # --------------------------------------------------------
 
-@client.event
-async def on_member_join(member):
-    # New members start at 400 ELO.
-    # Therefore they immediately receive C-Tier.
-    get_elo(member.id)
+    after_categories = [
+        role for role in after.roles
+        if role.id in CATEGORY_ROLES
+    ]
 
-    await updateRoles(
-        type(
-            "Context",
-            (),
-            {"guild": member.guild}
-        )(),
-        member
+    before_category = (
+        CATEGORY_ROLES[before_categories[0].id]
+        if before_categories
+        else None
     )
+
+    after_category = (
+        CATEGORY_ROLES[after_categories[0].id]
+        if after_categories
+        else None
+    )
+
+    # --------------------------------------------------------
+    # No category change
+    # --------------------------------------------------------
+
+    if before_category == after_category:
+        return
+
+    # Only trigger when a category has been selected.
+    if after_category is None:
+        return
+
+    # --------------------------------------------------------
+    # Remove any other category roles
+    # --------------------------------------------------------
+
+    selected_role = after_categories[0]
+
+    for role in after.guild.roles:
+        if role.id in CATEGORY_ROLES and role != selected_role:
+            if role in after.roles:
+                try:
+                    await after.remove_roles(role)
+                except discord.HTTPException as error:
+                    print(
+                        f"Could not remove category role "
+                        f"{role.name} from {after}: {error}"
+                    )
+
+    # --------------------------------------------------------
+    # Remove ALL tier roles
+    # --------------------------------------------------------
+
+    all_tier_roles = set(ELO_ROLES.keys()) | PERMANENT_TIER_ROLES
+
+    for role in after.guild.roles:
+        if role.name in all_tier_roles:
+            if role in after.roles:
+                try:
+                    await after.remove_roles(role)
+                except discord.HTTPException as error:
+                    print(
+                        f"Could not remove tier role "
+                        f"{role.name} from {after}: {error}"
+                    )
+
+    # --------------------------------------------------------
+    # Give Unranked
+    # --------------------------------------------------------
+
+    unranked_role = get_role(
+        after.guild,
+        "Unranked"
+    )
+
+    if unranked_role is not None:
+        if unranked_role not in after.roles:
+            try:
+                await after.add_roles(unranked_role)
+            except discord.HTTPException as error:
+                print(
+                    f"Could not add Unranked to "
+                    f"{after}: {error}"
+                )
+
+    # --------------------------------------------------------
+    # Get notification channel
+    # --------------------------------------------------------
+
+    notification_channel = after.guild.get_channel(
+        CATEGORY_NOTIFICATION_CHANNEL_ID
+    )
+
+    if notification_channel is None:
+        print(
+            f"Could not find notification channel: "
+            f"{CATEGORY_NOTIFICATION_CHANNEL_ID}"
+        )
+        return
+
+    # --------------------------------------------------------
+    # Get current ELO
+    # --------------------------------------------------------
+
+    current_elo = get_elo(after.id)
+
+    old_category = (
+        before_category
+        if before_category is not None
+        else "No Category"
+    )
+
+    # --------------------------------------------------------
+    # Get moderator role
+    # --------------------------------------------------------
+
+    moderator_role = after.guild.get_role(
+        MODERATOR_ROLE_ID
+    )
+
+    # --------------------------------------------------------
+    # Create notification
+    # --------------------------------------------------------
+
+    notification = (
+        f"**Duelist Category Changed**\n\n"
+        f"{after.mention} has changed their category:\n"
+        f"**{old_category} → {after_category}**\n\n"
+        f"Their tier has been reset to **Unranked**.\n"
+        f"Their ELO remains unchanged at **{current_elo}**."
+    )
+
+    # --------------------------------------------------------
+    # Ping Moderator
+    # --------------------------------------------------------
+
+    if moderator_role is not None:
+        await notification_channel.send(
+            f"{moderator_role.mention}\n{notification}",
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=True
+            )
+        )
+    else:
+        await notification_channel.send(
+            notification,
+            allowed_mentions=discord.AllowedMentions(
+                users=True
+            )
+        )
 
 
 @client.event
@@ -847,6 +1006,51 @@ async def updateuser(
         f"Updated {member.mention}'s ELO role."
     )
 
+# ============================================================
+# /say
+# ============================================================
+
+SAY_ROLE_ID = 1511114368027197501
+
+
+@tree.command(
+    name="say",
+    description="Make the bot send a message.",
+    guild=discord.Object(id=SERVER_ID)
+)
+@app_commands.describe(
+    message="The message you want the bot to send."
+)
+async def say(
+    ctx: discord.Interaction,
+    message: str
+):
+
+    # Check for the required role
+    required_role = ctx.guild.get_role(SAY_ROLE_ID)
+
+    if required_role is None:
+        await ctx.response.send_message(
+            "The required role could not be found.",
+            ephemeral=True
+        )
+        return
+
+    if required_role not in ctx.user.roles:
+        await ctx.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    # Acknowledge the command privately
+    await ctx.response.send_message(
+        "Message sent.",
+        ephemeral=True
+    )
+
+    # Make the bot send the message normally
+    await ctx.channel.send(message)
 
 # ============================================================
 # START BOT
