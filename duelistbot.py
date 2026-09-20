@@ -2419,9 +2419,9 @@ async def profile_reset(
     member: discord.Member
 ):
 
-    if not has_staff_permission(
-        ctx.user
-    ):
+if not has_elo_set_permission(
+    ctx.user
+):
 
         await deny(ctx)
         return
