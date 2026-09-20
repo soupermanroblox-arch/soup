@@ -1,4 +1,3 @@
-```python
 import discord
 import os
 import math
@@ -1690,4 +1689,3 @@ if not TOKEN:
 
 
 client.run(TOKEN)
-```
