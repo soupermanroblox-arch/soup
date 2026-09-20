@@ -2419,12 +2419,14 @@ async def profile_reset(
     member: discord.Member
 ):
 
+    # ONLY ROLE 1510774088354762915 CAN USE THIS
     if not has_elo_set_permission(
         ctx.user
     ):
 
         await deny(ctx)
         return
+
 
     if member.bot:
 
@@ -2436,6 +2438,260 @@ async def profile_reset(
         return
 
 
+    view = discord.ui.View(
+        timeout=30
+    )
+
+
+    async def check_user(
+        interaction
+    ):
+
+        if interaction.user.id != ctx.user.id:
+
+            await interaction.response.send_message(
+                "Only the staff member who started this reset can confirm it.",
+                ephemeral=True
+            )
+
+            return False
+
+        return True
+
+
+    view.interaction_check = check_user
+
+
+    confirm_button = discord.ui.Button(
+        label="Confirm Reset",
+        style=discord.ButtonStyle.danger
+    )
+
+
+    cancel_button = discord.ui.Button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary
+    )
+
+
+    async def confirm_callback(
+        interaction
+    ):
+
+        reset_time, old_elos = reset_profile(
+            member.id,
+            ctx.user.id
+        )
+
+
+        role_errors = 0
+
+
+        # ----------------------------------------------------
+        # REMOVE ALL TIER ROLES AND GIVE UNRANKED
+        # ----------------------------------------------------
+
+        for category in CATEGORY_ROLES:
+
+            role_ids = TIER_ROLE_IDS[
+                category
+            ]
+
+
+            for tier_name, role_id in role_ids.items():
+
+                role = ctx.guild.get_role(
+                    role_id
+                )
+
+
+                if role is None:
+
+                    continue
+
+
+                if role in member.roles:
+
+                    try:
+
+                        await member.remove_roles(
+                            role
+                        )
+
+                    except discord.HTTPException as error:
+
+                        role_errors += 1
+
+                        print(
+                            f"Could not remove {role.name} "
+                            f"from {member}: {error}"
+                        )
+
+
+            unranked_role = ctx.guild.get_role(
+                role_ids["Unranked"]
+            )
+
+
+            if (
+                unranked_role
+                and
+                unranked_role not in member.roles
+            ):
+
+                try:
+
+                    await member.add_roles(
+                        unranked_role
+                    )
+
+                except discord.HTTPException as error:
+
+                    role_errors += 1
+
+                    print(
+                        f"Could not add {unranked_role.name} "
+                        f"to {member}: {error}"
+                    )
+
+
+            # ------------------------------------------------
+            # AUDIT RESET
+            # ------------------------------------------------
+
+            audit(
+                member.id,
+                category,
+                old_elos[category],
+                400,
+                "PROFILE RESET",
+                None,
+                ctx.user.id
+            )
+
+
+        # ----------------------------------------------------
+        # LOG RESET
+        # ----------------------------------------------------
+
+        reset_embed = discord.Embed(
+            title="Profile Reset",
+            description=(
+                f"**User:** {member.mention}\n"
+                f"**Reset by:** {ctx.user.mention}\n\n"
+
+                f"**Duelist:** "
+                f"{old_elos['Duelist']} → 400\n"
+
+                f"**Soldier:** "
+                f"{old_elos['Soldier']} → 400\n"
+
+                f"**Aether Wielder:** "
+                f"{old_elos['Aether Wielder']} → 400"
+            )
+        )
+
+
+        logs = await get_logs_channel()
+
+
+        if logs:
+
+            await logs.send(
+                embed=reset_embed
+            )
+
+
+        # ----------------------------------------------------
+        # DISABLE BUTTONS
+        # ----------------------------------------------------
+
+        confirm_button.disabled = True
+        cancel_button.disabled = True
+
+
+        if role_errors:
+
+            result_text = (
+                f"Profile for {member.mention} has been reset.\n\n"
+                f"All ELO/stats were reset to **400/0**.\n"
+                f"Old match history remains stored but is hidden "
+                f"from the reset profile.\n\n"
+                f"⚠️ {role_errors} role update(s) failed. "
+                f"Check the bot's role hierarchy."
+            )
+
+        else:
+
+            result_text = (
+                f"Profile for {member.mention} has been reset.\n\n"
+                f"All categories are now **400 ELO** and **Unranked**.\n"
+                f"Wins, losses, streaks and peak ELO were reset.\n"
+                f"Previous match history remains stored but is hidden "
+                f"from the reset profile."
+            )
+
+
+        await interaction.response.edit_message(
+            content=result_text,
+            view=view
+        )
+
+
+        view.stop()
+
+
+    async def cancel_callback(
+        interaction
+    ):
+
+        confirm_button.disabled = True
+        cancel_button.disabled = True
+
+
+        await interaction.response.edit_message(
+            content="Profile reset cancelled.",
+            view=view
+        )
+
+
+        view.stop()
+
+
+    confirm_button.callback = confirm_callback
+    cancel_button.callback = cancel_callback
+
+
+    view.add_item(
+        confirm_button
+    )
+
+    view.add_item(
+        cancel_button
+    )
+
+
+    # --------------------------------------------------------
+    # CONFIRMATION MESSAGE
+    # --------------------------------------------------------
+
+    await ctx.response.send_message(
+        f"⚠️ **Profile Reset Confirmation**\n\n"
+        f"You are about to completely reset "
+        f"{member.mention}'s competitive profile.\n\n"
+        f"This will reset:\n"
+        f"• Duelist ELO/stats\n"
+        f"• Soldier ELO/stats\n"
+        f"• Aether Wielder ELO/stats\n"
+        f"• Wins and losses\n"
+        f"• Current streaks\n"
+        f"• Peak ELO\n"
+        f"• All tier roles\n\n"
+        f"The player will be returned to **Unranked**.\n\n"
+        f"Are you sure?",
+        view=view,
+        ephemeral=True
+    )
         # ----------------------------------------------------
         # REMOVE ALL TIER ROLES AND GIVE UNRANKED
         # ----------------------------------------------------
