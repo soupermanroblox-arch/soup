@@ -1,3 +1,4 @@
+```python
 import discord
 import os
 import math
@@ -5,7 +6,6 @@ import sqlite3
 import threading
 
 from discord import app_commands
-from discord.ext import commands
 from typing import Literal
 from flask import Flask
 
@@ -19,13 +19,23 @@ TOKEN = os.environ.get("TOKEN")
 SERVER_ID = 1490855505000796262
 LOGS_CHANNEL_ID = 1513934803412713592
 
+# Duelist Moderator role
 MODERATOR_ROLE_ID = 1490855600236789820
+
+# Category notification channel
 CATEGORY_NOTIFICATION_CHANNEL_ID = 1551022906916470875
+
+# Role allowed to use /say
+SAY_ROLE_ID = 1511114368027197501
 
 # ELO system
 K = 75
 
-# Automatic ELO roles
+
+# ============================================================
+# AUTOMATIC ELO ROLES
+# ============================================================
+
 ELO_ROLES = {
     "Unranked": (0, 399),
     "C-Tier": (400, 799),
@@ -36,23 +46,26 @@ ELO_ROLES = {
     "S-Tier": (2400, 2799),
 }
 
-# These are manually awarded and are NOT controlled by ELO.
+
+# ============================================================
+# MANUALLY AWARDED ROLES
+# ============================================================
+
 PERMANENT_TIER_ROLES = {
     "SS-Tier",
     "SSS-Tier",
 }
 
 
-# Category roles
+# ============================================================
+# CATEGORY ROLES
+# ============================================================
+
 CATEGORY_ROLES = {
     1548316579425554513: "Gunner",
     1548316920930115614: "Wielder",
     1548316617320964206: "Swordsman",
 }
-
-# Moderator notification
-MODERATOR_ROLE_ID = 1490855600236789820
-CATEGORY_NOTIFICATION_CHANNEL_ID = 1551022906916470875
 
 
 # ============================================================
@@ -76,16 +89,32 @@ cursor = connection.cursor()
 
 
 def create_database():
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS UserData (
             discordID INTEGER PRIMARY KEY,
-            elo INTEGER NOT NULL DEFAULT 400
+            elo INTEGER NOT NULL DEFAULT 400,
+            category_reset INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # --------------------------------------------------------
+    # Upgrade older databases
+    # --------------------------------------------------------
+
+    try:
+        cursor.execute(
+            "ALTER TABLE UserData "
+            "ADD COLUMN category_reset INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+
     connection.commit()
 
 
 def get_elo(member_id):
+
     cursor.execute(
         "SELECT elo FROM UserData WHERE discordID = ?",
         (member_id,)
@@ -94,23 +123,64 @@ def get_elo(member_id):
     result = cursor.fetchone()
 
     if result is None:
+
         cursor.execute(
-            "INSERT INTO UserData (discordID, elo) VALUES (?, ?)",
-            (member_id, 400)
+            "INSERT INTO UserData "
+            "(discordID, elo, category_reset) "
+            "VALUES (?, 400, 0)",
+            (member_id,)
         )
+
         connection.commit()
+
         return 400
 
     return result[0]
 
 
 def set_elo(member_id, elo):
+
     elo = max(0, int(elo))
 
     cursor.execute(
-        "INSERT INTO UserData (discordID, elo) VALUES (?, ?) "
-        "ON CONFLICT(discordID) DO UPDATE SET elo = excluded.elo",
+        "INSERT INTO UserData "
+        "(discordID, elo, category_reset) "
+        "VALUES (?, ?, 0) "
+        "ON CONFLICT(discordID) "
+        "DO UPDATE SET elo = excluded.elo",
         (member_id, elo)
+    )
+
+    connection.commit()
+
+
+def is_category_reset(member_id):
+
+    cursor.execute(
+        "SELECT category_reset "
+        "FROM UserData "
+        "WHERE discordID = ?",
+        (member_id,)
+    )
+
+    result = cursor.fetchone()
+
+    if result is None:
+        get_elo(member_id)
+        return False
+
+    return bool(result[0])
+
+
+def set_category_reset(member_id, value):
+
+    get_elo(member_id)
+
+    cursor.execute(
+        "UPDATE UserData "
+        "SET category_reset = ? "
+        "WHERE discordID = ?",
+        (1 if value else 0, member_id)
     )
 
     connection.commit()
@@ -129,7 +199,9 @@ def home():
 
 
 def run_flask():
+
     port = int(os.environ.get("PORT", 8080))
+
     app.run(
         host="0.0.0.0",
         port=port,
@@ -138,7 +210,10 @@ def run_flask():
     )
 
 
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(
+    target=run_flask,
+    daemon=True
+).start()
 
 
 # ============================================================
@@ -146,11 +221,18 @@ threading.Thread(target=run_flask, daemon=True).start()
 # ============================================================
 
 def get_role(guild, role_name):
-    return discord.utils.get(guild.roles, name=role_name)
+
+    return discord.utils.get(
+        guild.roles,
+        name=role_name
+    )
 
 
 def has_moderator_role(member):
-    role = get_role(member.guild, MODERATOR_ROLE_NAME)
+
+    role = member.guild.get_role(
+        MODERATOR_ROLE_ID
+    )
 
     if role is None:
         return False
@@ -159,17 +241,24 @@ def has_moderator_role(member):
 
 
 async def get_logs_channel():
+
     try:
-        return await client.fetch_channel(LOGS_CHANNEL_ID)
+        return await client.fetch_channel(
+            LOGS_CHANNEL_ID
+        )
+
     except discord.NotFound:
         return None
+
     except discord.Forbidden:
         return None
+
     except discord.HTTPException:
         return None
 
 
 def get_automatic_role_name(elo):
+
     if elo >= 2400:
         return "S-Tier"
 
@@ -191,16 +280,11 @@ def get_automatic_role_name(elo):
     return "Unranked"
 
 
+# ============================================================
+# UPDATE ELO ROLES
+# ============================================================
+
 async def updateRoles(ctx, user):
-    """
-    Updates a user's automatic ELO rank.
-
-    SS-Tier and SSS-Tier are manually awarded ranks and are
-    intentionally preserved regardless of ELO.
-
-    If a user has SS-Tier or SSS-Tier, their automatic rank
-    will not be changed.
-    """
 
     if user is None or ctx.guild is None:
         return
@@ -208,42 +292,137 @@ async def updateRoles(ctx, user):
     user_elo = get_elo(user.id)
 
     # --------------------------------------------------------
-    # Preserve manually awarded SS / SSS ranks
+    # Category reset protection
     # --------------------------------------------------------
 
-    sss_role = get_role(ctx.guild, "SSS-Tier")
-    ss_role = get_role(ctx.guild, "SS-Tier")
+    if is_category_reset(user.id):
+
+        unranked_role = get_role(
+            ctx.guild,
+            "Unranked"
+        )
+
+        if unranked_role is None:
+            print(
+                "WARNING: Could not find Discord role "
+                "'Unranked'."
+            )
+
+            return
+
+        # Remove every automatic ELO role except Unranked.
+
+        for role_name in ELO_ROLES:
+
+            role = get_role(
+                ctx.guild,
+                role_name
+            )
+
+            if (
+                role is not None
+                and role != unranked_role
+                and role in user.roles
+            ):
+
+                try:
+                    await user.remove_roles(role)
+
+                except discord.HTTPException:
+                    pass
+
+        # Remove SS / SSS if somehow present.
+
+        for role_name in PERMANENT_TIER_ROLES:
+
+            role = get_role(
+                ctx.guild,
+                role_name
+            )
+
+            if role is not None and role in user.roles:
+
+                try:
+                    await user.remove_roles(role)
+
+                except discord.HTTPException:
+                    pass
+
+        # Make sure Unranked exists.
+
+        if unranked_role not in user.roles:
+
+            try:
+                await user.add_roles(
+                    unranked_role
+                )
+
+            except discord.HTTPException as error:
+
+                print(
+                    f"Could not add Unranked to "
+                    f"{user}: {error}"
+                )
+
+        return
+
+    # --------------------------------------------------------
+    # Preserve manually awarded SS / SSS
+    # --------------------------------------------------------
+
+    sss_role = get_role(
+        ctx.guild,
+        "SSS-Tier"
+    )
+
+    ss_role = get_role(
+        ctx.guild,
+        "SS-Tier"
+    )
 
     if (
         (sss_role is not None and sss_role in user.roles)
         or
         (ss_role is not None and ss_role in user.roles)
     ):
-        # Remove all automatic ELO roles so the manually
-        # awarded SS/SSS rank is the only tier role.
+
         for role_name in ELO_ROLES:
-            role = get_role(ctx.guild, role_name)
+
+            role = get_role(
+                ctx.guild,
+                role_name
+            )
 
             if role is not None and role in user.roles:
+
                 try:
                     await user.remove_roles(role)
+
                 except discord.HTTPException:
                     pass
 
         return
 
     # --------------------------------------------------------
-    # Determine automatic role
+    # Determine automatic rank
     # --------------------------------------------------------
 
-    automatic_role_name = get_automatic_role_name(user_elo)
-    automatic_role = get_role(ctx.guild, automatic_role_name)
+    automatic_role_name = get_automatic_role_name(
+        user_elo
+    )
+
+    automatic_role = get_role(
+        ctx.guild,
+        automatic_role_name
+    )
 
     if automatic_role is None:
+
         print(
             f"WARNING: Could not find Discord role "
             f"'{automatic_role_name}'."
         )
+
         return
 
     # --------------------------------------------------------
@@ -251,86 +430,155 @@ async def updateRoles(ctx, user):
     # --------------------------------------------------------
 
     for role_name in ELO_ROLES:
-        role = get_role(ctx.guild, role_name)
 
-        if role is not None and role != automatic_role:
-            if role in user.roles:
-                try:
-                    await user.remove_roles(role)
-                except discord.HTTPException as error:
-                    print(
-                        f"Could not remove {role_name} from "
-                        f"{user}: {error}"
-                    )
+        role = get_role(
+            ctx.guild,
+            role_name
+        )
+
+        if (
+            role is not None
+            and role != automatic_role
+            and role in user.roles
+        ):
+
+            try:
+                await user.remove_roles(role)
+
+            except discord.HTTPException as error:
+
+                print(
+                    f"Could not remove {role_name} "
+                    f"from {user}: {error}"
+                )
 
     # --------------------------------------------------------
     # Add correct role
     # --------------------------------------------------------
 
     if automatic_role not in user.roles:
+
         try:
-            await user.add_roles(automatic_role)
+            await user.add_roles(
+                automatic_role
+            )
+
         except discord.HTTPException as error:
+
             print(
-                f"Could not add {automatic_role_name} to "
-                f"{user}: {error}"
+                f"Could not add "
+                f"{automatic_role_name} "
+                f"to {user}: {error}"
             )
 
 
-async def update_rank_sets(ctx, winner, loser):
-    await updateRoles(ctx, winner)
-    await updateRoles(ctx, loser)
+async def update_rank_sets(
+    ctx,
+    winner,
+    loser
+):
 
+    await updateRoles(
+        ctx,
+        winner
+    )
 
-def probability(rating1, rating2):
-    return 1.0 / (
-        1 + math.pow(10, (rating1 - rating2) / 1500.0)
+    await updateRoles(
+        ctx,
+        loser
     )
 
 
-def elo_rating(Ra, Rb, K, outcome):
-    """
-    Calculates the new ELO ratings.
+# ============================================================
+# ELO CALCULATIONS
+# ============================================================
 
-    outcome:
-        1 = Player A wins
-        0 = Player B wins
-    """
+def probability(
+    rating1,
+    rating2
+):
 
-    Pb = probability(Ra, Rb)
-    Pa = probability(Rb, Ra)
+    return 1.0 / (
+        1 + math.pow(
+            10,
+            (rating1 - rating2) / 1500.0
+        )
+    )
 
-    rating_diff = abs(Ra - Rb)
-    multiplier = pow(1.05, rating_diff // 100)
+
+def elo_rating(
+    Ra,
+    Rb,
+    K,
+    outcome
+):
+
+    Pb = probability(
+        Ra,
+        Rb
+    )
+
+    Pa = probability(
+        Rb,
+        Ra
+    )
+
+    rating_diff = abs(
+        Ra - Rb
+    )
+
+    multiplier = pow(
+        1.05,
+        rating_diff // 100
+    )
 
     if Ra < Rb:
+
         underdog = "player1"
+
     elif Rb < Ra:
+
         underdog = "player2"
+
     else:
+
         underdog = None
 
     if underdog == "player1":
+
         Ra = round(
-            Ra + (K * multiplier) * (outcome - Pa)
+            Ra
+            + (K * multiplier)
+            * (outcome - Pa)
         )
 
         Rb = round(
-            Rb + (K * multiplier) * ((1 - outcome) - Pb)
+            Rb
+            + (K * multiplier)
+            * ((1 - outcome) - Pb)
         )
 
     else:
+
         Ra = round(
-            Ra + K * (outcome - Pa)
+            Ra
+            + K * (outcome - Pa)
         )
 
         Rb = round(
-            Rb + K * ((1 - outcome) - Pb)
+            Rb
+            + K * ((1 - outcome) - Pb)
         )
 
-    # ELO cannot go below 0.
-    Ra = max(0, Ra)
-    Rb = max(0, Rb)
+    Ra = max(
+        0,
+        Ra
+    )
+
+    Rb = max(
+        0,
+        Rb
+    )
 
     return Ra, Rb
 
@@ -340,26 +588,84 @@ def elo_rating(Ra, Rb, K, outcome):
 # ============================================================
 
 @client.event
-async def on_member_update(before, after):
-    """
-    Detects when a duelist changes between:
-    Swordsman, Wielder, and Gunner.
+async def on_ready():
 
-    When their category changes:
-    - Their old category is removed.
-    - Their new category remains.
-    - All tier roles are removed.
-    - They receive Unranked.
-    - Their ELO stays unchanged.
-    - Duelist Moderator is pinged in the notification channel.
-    """
+    create_database()
+
+    print(
+        f"{client.user} has connected to Discord."
+    )
+
+    guild = discord.Object(
+        id=SERVER_ID
+    )
+
+    try:
+
+        await tree.sync(
+            guild=guild
+        )
+
+        print(
+            "Slash commands synced."
+        )
+
+    except discord.HTTPException as error:
+
+        print(
+            f"Failed to sync slash commands: {error}"
+        )
+
+
+# ============================================================
+# MEMBER JOIN
+# ============================================================
+
+@client.event
+async def on_member_join(member):
+
+    # New members start at 400 ELO.
+
+    get_elo(
+        member.id
+    )
+
+    # New members are not category-reset.
+
+    set_category_reset(
+        member.id,
+        False
+    )
+
+    await updateRoles(
+        type(
+            "Context",
+            (),
+            {
+                "guild": member.guild
+            }
+        )(),
+        member
+    )
+
+
+# ============================================================
+# CATEGORY SWITCH DETECTION
+# ============================================================
+
+@client.event
+async def on_member_update(
+    before,
+    after
+):
 
     # --------------------------------------------------------
     # Find category before the change
     # --------------------------------------------------------
 
     before_categories = [
-        role for role in before.roles
+        role
+        for role in before.roles
         if role.id in CATEGORY_ROLES
     ]
 
@@ -368,69 +674,113 @@ async def on_member_update(before, after):
     # --------------------------------------------------------
 
     after_categories = [
-        role for role in after.roles
+        role
+        for role in after.roles
         if role.id in CATEGORY_ROLES
     ]
 
     before_category = (
-        CATEGORY_ROLES[before_categories[0].id]
+        CATEGORY_ROLES[
+            before_categories[0].id
+        ]
         if before_categories
         else None
     )
 
     after_category = (
-        CATEGORY_ROLES[after_categories[0].id]
+        CATEGORY_ROLES[
+            after_categories[0].id
+        ]
         if after_categories
         else None
     )
 
     # --------------------------------------------------------
-    # No category change
+    # No actual category change
     # --------------------------------------------------------
 
     if before_category == after_category:
         return
 
-    # Only trigger when a category has been selected.
+    # --------------------------------------------------------
+    # Only trigger when switching FROM one category
+    # TO another category.
+    #
+    # Initial category selection does not trigger.
+    # --------------------------------------------------------
+
+    if before_category is None:
+        return
+
     if after_category is None:
         return
 
     # --------------------------------------------------------
-    # Remove any other category roles
+    # Make sure only the selected category remains
     # --------------------------------------------------------
 
     selected_role = after_categories[0]
 
     for role in after.guild.roles:
-        if role.id in CATEGORY_ROLES and role != selected_role:
-            if role in after.roles:
-                try:
-                    await after.remove_roles(role)
-                except discord.HTTPException as error:
-                    print(
-                        f"Could not remove category role "
-                        f"{role.name} from {after}: {error}"
-                    )
+
+        if (
+            role.id in CATEGORY_ROLES
+            and role != selected_role
+            and role in after.roles
+        ):
+
+            try:
+
+                await after.remove_roles(
+                    role
+                )
+
+            except discord.HTTPException as error:
+
+                print(
+                    f"Could not remove category role "
+                    f"{role.name} from {after}: {error}"
+                )
+
+    # --------------------------------------------------------
+    # Mark the player as category-reset
+    # --------------------------------------------------------
+
+    set_category_reset(
+        after.id,
+        True
+    )
 
     # --------------------------------------------------------
     # Remove ALL tier roles
     # --------------------------------------------------------
 
-    all_tier_roles = set(ELO_ROLES.keys()) | PERMANENT_TIER_ROLES
+    all_tier_roles = (
+        set(ELO_ROLES.keys())
+        | PERMANENT_TIER_ROLES
+    )
 
     for role in after.guild.roles:
+
         if role.name in all_tier_roles:
+
             if role in after.roles:
+
                 try:
-                    await after.remove_roles(role)
+
+                    await after.remove_roles(
+                        role
+                    )
+
                 except discord.HTTPException as error:
+
                     print(
                         f"Could not remove tier role "
                         f"{role.name} from {after}: {error}"
                     )
 
     # --------------------------------------------------------
-    # Give Unranked
+    # Add Unranked
     # --------------------------------------------------------
 
     unranked_role = get_role(
@@ -439,10 +789,17 @@ async def on_member_update(before, after):
     )
 
     if unranked_role is not None:
+
         if unranked_role not in after.roles:
+
             try:
-                await after.add_roles(unranked_role)
+
+                await after.add_roles(
+                    unranked_role
+                )
+
             except discord.HTTPException as error:
+
                 print(
                     f"Could not add Unranked to "
                     f"{after}: {error}"
@@ -452,27 +809,27 @@ async def on_member_update(before, after):
     # Get notification channel
     # --------------------------------------------------------
 
-    notification_channel = after.guild.get_channel(
-        CATEGORY_NOTIFICATION_CHANNEL_ID
+    notification_channel = (
+        after.guild.get_channel(
+            CATEGORY_NOTIFICATION_CHANNEL_ID
+        )
     )
 
     if notification_channel is None:
+
         print(
             f"Could not find notification channel: "
             f"{CATEGORY_NOTIFICATION_CHANNEL_ID}"
         )
+
         return
 
     # --------------------------------------------------------
     # Get current ELO
     # --------------------------------------------------------
 
-    current_elo = get_elo(after.id)
-
-    old_category = (
-        before_category
-        if before_category is not None
-        else "No Category"
+    current_elo = get_elo(
+        after.id
     )
 
     # --------------------------------------------------------
@@ -484,30 +841,35 @@ async def on_member_update(before, after):
     )
 
     # --------------------------------------------------------
-    # Create notification
+    # Notification
     # --------------------------------------------------------
 
     notification = (
         f"**Duelist Category Changed**\n\n"
         f"{after.mention} has changed their category:\n"
-        f"**{old_category} → {after_category}**\n\n"
+        f"**{before_category} → {after_category}**\n\n"
         f"Their tier has been reset to **Unranked**.\n"
-        f"Their ELO remains unchanged at **{current_elo}**."
+        f"Their ELO remains unchanged at "
+        f"**{current_elo}**."
     )
 
     # --------------------------------------------------------
-    # Ping Moderator
+    # Ping Duelist Moderators
     # --------------------------------------------------------
 
     if moderator_role is not None:
+
         await notification_channel.send(
-            f"{moderator_role.mention}\n{notification}",
+            f"{moderator_role.mention}\n"
+            f"{notification}",
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
                 users=True
             )
         )
+
     else:
+
         await notification_channel.send(
             notification,
             allowed_mentions=discord.AllowedMentions(
@@ -516,21 +878,31 @@ async def on_member_update(before, after):
         )
 
 
+# ============================================================
+# MESSAGE EVENT
+# ============================================================
+
 @client.event
 async def on_message(message):
+
     if message.author.bot:
         return
 
     if message.author.id == 1286730886074597389:
+
         if message.content == "say it":
+
             logs_channel = await get_logs_channel()
 
             if logs_channel:
+
                 await logs_channel.send(
                     "soup is the GOAT!!!!! :fire:"
                 )
 
-    await client.process_commands(message)
+    await client.process_commands(
+        message
+    )
 
 
 # ============================================================
@@ -552,33 +924,63 @@ async def setelo(
     elo: int
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
-    elo = max(0, elo)
+    elo = max(
+        0,
+        elo
+    )
 
-    set_elo(member.id, elo)
+    set_elo(
+        member.id,
+        elo
+    )
 
-    await updateRoles(ctx, member)
+    # A moderator manually setting ELO
+    # removes the category reset.
+
+    set_category_reset(
+        member.id,
+        False
+    )
+
+    await updateRoles(
+        ctx,
+        member
+    )
 
     embed = discord.Embed(
-        title=f"{member.display_name}'s ELO has been set.",
+        title=(
+            f"{member.display_name}'s "
+            f"ELO has been set."
+        ),
         description=(
             f"<@{ctx.user.id}> set "
-            f"<@{member.id}>'s ELO to **{elo}**."
+            f"<@{member.id}>'s ELO to "
+            f"**{elo}**."
         )
     )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
     logs_channel = await get_logs_channel()
 
     if logs_channel:
-        await logs_channel.send(embed=embed)
+
+        await logs_channel.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -600,43 +1002,77 @@ async def addelo(
     elo: int
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
     if elo < 0:
+
         await ctx.response.send_message(
             "ELO amount cannot be negative.",
             ephemeral=True
         )
+
         return
 
-    current_elo = get_elo(member.id)
-    new_elo = current_elo + elo
+    current_elo = get_elo(
+        member.id
+    )
 
-    set_elo(member.id, new_elo)
+    new_elo = (
+        current_elo
+        + elo
+    )
 
-    await updateRoles(ctx, member)
+    set_elo(
+        member.id,
+        new_elo
+    )
+
+    # Moderator manually changed ELO.
+
+    set_category_reset(
+        member.id,
+        False
+    )
+
+    await updateRoles(
+        ctx,
+        member
+    )
 
     embed = discord.Embed(
-        title=f"{member.display_name}'s ELO has been updated.",
+        title=(
+            f"{member.display_name}'s "
+            f"ELO has been updated."
+        ),
         description=(
-            f"<@{ctx.user.id}> added **{elo} ELO** to "
+            f"<@{ctx.user.id}> added "
+            f"**{elo} ELO** to "
             f"<@{member.id}>.\n\n"
             f"Previous ELO: **{current_elo}**\n"
             f"New ELO: **{new_elo}**"
         )
     )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
     logs_channel = await get_logs_channel()
 
     if logs_channel:
-        await logs_channel.send(embed=embed)
+
+        await logs_channel.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -658,43 +1094,77 @@ async def removelo(
     elo: int
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
     if elo < 0:
+
         await ctx.response.send_message(
             "ELO amount cannot be negative.",
             ephemeral=True
         )
+
         return
 
-    current_elo = get_elo(member.id)
-    new_elo = max(0, current_elo - elo)
+    current_elo = get_elo(
+        member.id
+    )
 
-    set_elo(member.id, new_elo)
+    new_elo = max(
+        0,
+        current_elo - elo
+    )
 
-    await updateRoles(ctx, member)
+    set_elo(
+        member.id,
+        new_elo
+    )
+
+    # Moderator manually changed ELO.
+
+    set_category_reset(
+        member.id,
+        False
+    )
+
+    await updateRoles(
+        ctx,
+        member
+    )
 
     embed = discord.Embed(
-        title=f"{member.display_name}'s ELO has been updated.",
+        title=(
+            f"{member.display_name}'s "
+            f"ELO has been updated."
+        ),
         description=(
-            f"<@{ctx.user.id}> removed **{elo} ELO** from "
+            f"<@{ctx.user.id}> removed "
+            f"**{elo} ELO** from "
             f"<@{member.id}>.\n\n"
             f"Previous ELO: **{current_elo}**\n"
             f"New ELO: **{new_elo}**"
         )
     )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
     logs_channel = await get_logs_channel()
 
     if logs_channel:
-        await logs_channel.send(embed=embed)
+
+        await logs_channel.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -717,27 +1187,69 @@ async def elocheck(
     if member is None:
         member = ctx.user
 
-    user_elo = get_elo(member.id)
+    user_elo = get_elo(
+        member.id
+    )
 
-    await updateRoles(ctx, member)
+    # If category-reset, keep them Unranked.
 
-    rank = get_automatic_role_name(user_elo)
+    if is_category_reset(
+        member.id
+    ):
 
-    # Display manually awarded ranks if applicable.
-    if get_role(ctx.guild, "SSS-Tier") in member.roles:
-        rank = "SSS-Tier"
-    elif get_role(ctx.guild, "SS-Tier") in member.roles:
-        rank = "SS-Tier"
+        rank = "Unranked"
+
+    else:
+
+        await updateRoles(
+            ctx,
+            member
+        )
+
+        rank = get_automatic_role_name(
+            user_elo
+        )
+
+        # Display manually awarded ranks.
+
+        sss_role = get_role(
+            ctx.guild,
+            "SSS-Tier"
+        )
+
+        ss_role = get_role(
+            ctx.guild,
+            "SS-Tier"
+        )
+
+        if (
+            sss_role is not None
+            and sss_role in member.roles
+        ):
+
+            rank = "SSS-Tier"
+
+        elif (
+            ss_role is not None
+            and ss_role in member.roles
+        ):
+
+            rank = "SS-Tier"
 
     embed = discord.Embed(
-        title=f"{member.display_name}'s ELO",
+        title=(
+            f"{member.display_name}'s ELO"
+        ),
         description=(
-            f"<@{member.id}> has an ELO of **{user_elo}**.\n"
+            f"<@{member.id}> has an ELO of "
+            f"**{user_elo}**.\n"
             f"Rank: **{rank}**"
         )
     )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
 
 # ============================================================
@@ -761,22 +1273,33 @@ async def submit(
     proof: discord.Attachment
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
     if winner.id == loser.id:
+
         await ctx.response.send_message(
             "The winner and loser cannot be the same person.",
             ephemeral=True
         )
+
         return
 
-    winner_elo = get_elo(winner.id)
-    loser_elo = get_elo(loser.id)
+    winner_elo = get_elo(
+        winner.id
+    )
+
+    loser_elo = get_elo(
+        loser.id
+    )
 
     new_winner_elo, new_loser_elo = elo_rating(
         winner_elo,
@@ -785,13 +1308,27 @@ async def submit(
         1
     )
 
-    set_elo(winner.id, new_winner_elo)
-    set_elo(loser.id, new_loser_elo)
+    set_elo(
+        winner.id,
+        new_winner_elo
+    )
 
-    await update_rank_sets(ctx, winner, loser)
+    set_elo(
+        loser.id,
+        new_loser_elo
+    )
+
+    await update_rank_sets(
+        ctx,
+        winner,
+        loser
+    )
 
     embed = discord.Embed(
-        title=f"{winner.display_name} VS {loser.display_name}",
+        title=(
+            f"{winner.display_name} VS "
+            f"{loser.display_name}"
+        ),
         description=(
             "A duel has concluded.\n\n"
             f"Winner: {winner.display_name} "
@@ -802,14 +1339,21 @@ async def submit(
         )
     )
 
-    embed.set_image(url=proof.url)
+    embed.set_image(
+        url=proof.url
+    )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
     logs_channel = await get_logs_channel()
 
     if logs_channel:
-        await logs_channel.send(embed=embed)
+
+        await logs_channel.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -838,18 +1382,24 @@ async def tieredsubmit(
     ]
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
     if winner.id == loser.id:
+
         await ctx.response.send_message(
             "The winner and loser cannot be the same person.",
             ephemeral=True
         )
+
         return
 
     # --------------------------------------------------------
@@ -858,14 +1408,14 @@ async def tieredsubmit(
 
     if challengerstatus == "Challenger Won":
 
-        loser_elo = get_elo(loser.id)
+        loser_elo = get_elo(
+            loser.id
+        )
 
-        # Determine the loser's current automatic rank.
-        loser_rank = get_automatic_role_name(loser_elo)
+        loser_rank = get_automatic_role_name(
+            loser_elo
+        )
 
-        # Existing tiered-match system:
-        # Winner is placed at a representative ELO based
-        # on the loser's tier.
         placement_elo = {
             "Quasi-S-Tier": 1850,
             "A-Tier": 1450,
@@ -874,15 +1424,23 @@ async def tieredsubmit(
         }
 
         if loser_rank in placement_elo:
+
             set_elo(
                 winner.id,
-                placement_elo[loser_rank]
+                placement_elo[
+                    loser_rank
+                ]
             )
 
-        # Challenger who loses 250 ELO.
-        new_loser_elo = max(0, loser_elo - 250)
+        new_loser_elo = max(
+            0,
+            loser_elo - 250
+        )
 
-        set_elo(loser.id, new_loser_elo)
+        set_elo(
+            loser.id,
+            new_loser_elo
+        )
 
     # --------------------------------------------------------
     # Challenger LOST
@@ -890,8 +1448,13 @@ async def tieredsubmit(
 
     elif challengerstatus == "Challenger Lost":
 
-        winner_elo = get_elo(winner.id)
-        loser_elo = get_elo(loser.id)
+        winner_elo = get_elo(
+            winner.id
+        )
+
+        loser_elo = get_elo(
+            loser.id
+        )
 
         new_winner_elo, new_loser_elo = elo_rating(
             winner_elo,
@@ -900,22 +1463,39 @@ async def tieredsubmit(
             1
         )
 
-        set_elo(winner.id, new_winner_elo)
-        set_elo(loser.id, new_loser_elo)
+        set_elo(
+            winner.id,
+            new_winner_elo
+        )
+
+        set_elo(
+            loser.id,
+            new_loser_elo
+        )
 
     # --------------------------------------------------------
     # Update roles
     # --------------------------------------------------------
 
-    await update_rank_sets(ctx, winner, loser)
+    await update_rank_sets(
+        ctx,
+        winner,
+        loser
+    )
 
-    winner_elo = get_elo(winner.id)
-    loser_elo = get_elo(loser.id)
+    winner_elo = get_elo(
+        winner.id
+    )
+
+    loser_elo = get_elo(
+        loser.id
+    )
 
     embed = discord.Embed(
         title=(
             f"{winner.display_name} VS "
-            f"{loser.display_name} [TIERED]"
+            f"{loser.display_name} "
+            f"[TIERED]"
         ),
         description=(
             "A tiered duel has concluded.\n\n"
@@ -927,14 +1507,21 @@ async def tieredsubmit(
         )
     )
 
-    embed.set_image(url=proof.url)
+    embed.set_image(
+        url=proof.url
+    )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
     logs_channel = await get_logs_channel()
 
     if logs_channel:
-        await logs_channel.send(embed=embed)
+
+        await logs_channel.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -946,7 +1533,9 @@ async def tieredsubmit(
     description="Check the current standings!",
     guild=discord.Object(id=SERVER_ID)
 )
-async def showleaderboard(ctx: discord.Interaction):
+async def showleaderboard(
+    ctx: discord.Interaction
+):
 
     cursor.execute(
         "SELECT elo, discordID "
@@ -962,18 +1551,34 @@ async def showleaderboard(ctx: discord.Interaction):
     )
 
     if not leaderboard:
-        embed.description = "There are currently no ranked users."
-        await ctx.response.send_message(embed=embed)
+
+        embed.description = (
+            "There are currently no ranked users."
+        )
+
+        await ctx.response.send_message(
+            embed=embed
+        )
+
         return
 
-    for index, value in enumerate(leaderboard, start=1):
+    for index, value in enumerate(
+        leaderboard,
+        start=1
+    ):
+
         embed.add_field(
             name=f"#{index}",
-            value=f"<@{value[1]}> - **{value[0]} ELO**",
+            value=(
+                f"<@{value[1]}> - "
+                f"**{value[0]} ELO**"
+            ),
             inline=False
         )
 
-    await ctx.response.send_message(embed=embed)
+    await ctx.response.send_message(
+        embed=embed
+    )
 
 
 # ============================================================
@@ -993,25 +1598,38 @@ async def updateuser(
     member: discord.Member
 ):
 
-    if not has_moderator_role(ctx.user):
+    if not has_moderator_role(
+        ctx.user
+    ):
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
-    await updateRoles(ctx, member)
+    # A moderator manually updating the user
+    # removes their category-reset state.
+
+    set_category_reset(
+        member.id,
+        False
+    )
+
+    await updateRoles(
+        ctx,
+        member
+    )
 
     await ctx.response.send_message(
         f"Updated {member.mention}'s ELO role."
     )
 
+
 # ============================================================
 # /say
 # ============================================================
-
-SAY_ROLE_ID = 1511114368027197501
-
 
 @tree.command(
     name="say",
@@ -1026,40 +1644,50 @@ async def say(
     message: str
 ):
 
-    # Check for the required role
-    required_role = ctx.guild.get_role(SAY_ROLE_ID)
+    required_role = ctx.guild.get_role(
+        SAY_ROLE_ID
+    )
 
     if required_role is None:
+
         await ctx.response.send_message(
             "The required role could not be found.",
             ephemeral=True
         )
+
         return
 
     if required_role not in ctx.user.roles:
+
         await ctx.response.send_message(
             "You do not have permission to use this command.",
             ephemeral=True
         )
+
         return
 
-    # Acknowledge the command privately
     await ctx.response.send_message(
         "Message sent.",
         ephemeral=True
     )
 
-    # Make the bot send the message normally
-    await ctx.channel.send(message)
+    await ctx.channel.send(
+        message
+    )
+
 
 # ============================================================
 # START BOT
 # ============================================================
 
 if not TOKEN:
+
     raise RuntimeError(
         "TOKEN environment variable is missing. "
-        "Add your Discord bot token as TOKEN in your hosting environment."
+        "Add your Discord bot token as TOKEN "
+        "in your hosting environment."
     )
 
+
 client.run(TOKEN)
+```
