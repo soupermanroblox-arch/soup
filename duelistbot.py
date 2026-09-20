@@ -7,9 +7,9 @@ import shutil
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from discord import app_commands
-from typing import Optional
 from flask import Flask
 
 
@@ -25,7 +25,7 @@ LOGS_CHANNEL_ID = 1513934803412713592
 MODERATOR_ROLE_ID = 1490855600236789820
 DUELIST_STAFF_ROLE_ID = 1515821480464875590
 
-# ONLY this role can use /elo_set
+# ONLY this role can use /elo_set and /profile_reset
 ELO_SET_ROLE_ID = 1510774088354762915
 
 CATEGORY_NOTIFICATION_CHANNEL_ID = 1551022906916470875
@@ -35,7 +35,7 @@ K = 75
 
 
 # ============================================================
-# CATEGORY ROLES
+# CATEGORIES
 # ============================================================
 
 CATEGORY_ROLES = {
@@ -46,7 +46,7 @@ CATEGORY_ROLES = {
 
 
 # ============================================================
-# TIER ROLE IDS
+# TIER NAMES
 # ============================================================
 
 TIER_NAMES = [
@@ -62,8 +62,11 @@ TIER_NAMES = [
 ]
 
 
-TIER_ROLE_IDS = {
+# ============================================================
+# TIER ROLE IDS
+# ============================================================
 
+TIER_ROLE_IDS = {
     "Duelist": {
         "Unranked": 1523740132904276068,
         "C-Tier": 1490855609212600390,
@@ -103,7 +106,7 @@ TIER_ROLE_IDS = {
 
 
 # ============================================================
-# AUTOMATIC ELO RANGES
+# AUTOMATIC RANKS
 # ============================================================
 
 AUTOMATIC_RANKS = {
@@ -118,7 +121,7 @@ AUTOMATIC_RANKS = {
 
 
 # ============================================================
-# TIERED MATCH PLACEMENTS
+# PLACEMENT ELO
 # ============================================================
 
 PLACEMENT_ELO = {
@@ -164,21 +167,17 @@ def db_execute(
     fetchall=False,
     commit=False
 ):
-
     with db_lock:
-
         cursor = connection.cursor()
-
         cursor.execute(sql, params)
+
+        result = None
 
         if fetchone:
             result = cursor.fetchone()
 
         elif fetchall:
             result = cursor.fetchall()
-
-        else:
-            result = None
 
         if commit:
             connection.commit()
@@ -187,15 +186,8 @@ def db_execute(
 
 
 def create_database():
-
     with db_lock:
-
         cursor = connection.cursor()
-
-
-        # ----------------------------------------------------
-        # OLD TABLE
-        # ----------------------------------------------------
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS UserData (
@@ -205,42 +197,24 @@ def create_database():
             )
         """)
 
-
-        # ----------------------------------------------------
-        # CATEGORY ELO / STATS
-        # ----------------------------------------------------
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS CategoryData (
                 discordID INTEGER NOT NULL,
                 category TEXT NOT NULL,
-
                 elo INTEGER NOT NULL DEFAULT 400,
-
                 wins INTEGER NOT NULL DEFAULT 0,
                 losses INTEGER NOT NULL DEFAULT 0,
-
                 current_streak INTEGER NOT NULL DEFAULT 0,
                 peak_elo INTEGER NOT NULL DEFAULT 400,
-
                 PRIMARY KEY (discordID, category)
             )
         """)
 
-
-        # ----------------------------------------------------
-        # MATCH HISTORY
-        # ----------------------------------------------------
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS Matches (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 match_code TEXT UNIQUE NOT NULL,
-
                 category TEXT NOT NULL,
-
                 winner_id INTEGER NOT NULL,
                 loser_id INTEGER NOT NULL,
 
@@ -259,82 +233,46 @@ def create_database():
                 loser_streak_before INTEGER NOT NULL,
 
                 proof TEXT NOT NULL,
-
                 submitted_by INTEGER NOT NULL,
-
                 match_type TEXT NOT NULL,
-
                 created_at TEXT NOT NULL,
 
                 undone INTEGER NOT NULL DEFAULT 0
             )
         """)
 
-
-        # ----------------------------------------------------
-        # ELO AUDIT LOG
-        # ----------------------------------------------------
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS EloAudit (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 discordID INTEGER NOT NULL,
-
                 category TEXT NOT NULL,
-
                 old_elo INTEGER NOT NULL,
                 new_elo INTEGER NOT NULL,
-
                 action TEXT NOT NULL,
-
                 match_code TEXT,
-
                 staff_id INTEGER NOT NULL,
-
                 created_at TEXT NOT NULL
             )
         """)
 
-
-        # ----------------------------------------------------
-        # PROFILE RESET TRACKING
-        # ----------------------------------------------------
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ProfileResets (
-
                 discordID INTEGER PRIMARY KEY,
-
                 reset_at TEXT NOT NULL,
-
                 reset_by INTEGER NOT NULL
             )
         """)
 
-
-        # ----------------------------------------------------
-        # MIGRATE OLD ELO SYSTEM
-        # ----------------------------------------------------
-
+        # Migrate old UserData into the new category system.
         users = cursor.execute(
             "SELECT discordID, elo FROM UserData"
         ).fetchall()
 
-
         for user in users:
-
-            user_id = user[0]
-
-            old_elo = max(
-                0,
-                int(user[1])
-            )
-
+            member_id = user["discordID"]
+            old_elo = max(0, int(user["elo"]))
 
             for category in CATEGORY_ROLES:
-
                 cursor.execute("""
                     INSERT OR IGNORE INTO CategoryData
                     (
@@ -343,25 +281,20 @@ def create_database():
                         elo,
                         peak_elo
                     )
-
                     VALUES (?, ?, ?, ?)
                 """, (
-                    user_id,
+                    member_id,
                     category,
                     old_elo,
                     old_elo
                 ))
 
-
         connection.commit()
 
 
 def ensure_user(member_id):
-
     with db_lock:
-
         cursor = connection.cursor()
-
 
         cursor.execute("""
             INSERT OR IGNORE INTO UserData
@@ -370,15 +303,10 @@ def ensure_user(member_id):
                 elo,
                 category_reset
             )
-
             VALUES (?, 400, 0)
-        """, (
-            member_id,
-        ))
-
+        """, (member_id,))
 
         for category in CATEGORY_ROLES:
-
             cursor.execute("""
                 INSERT OR IGNORE INTO CategoryData
                 (
@@ -387,80 +315,47 @@ def ensure_user(member_id):
                     elo,
                     peak_elo
                 )
-
                 VALUES (?, ?, 400, 400)
             """, (
                 member_id,
                 category
             ))
 
-
         connection.commit()
 
 
-def get_stats(
-    member_id,
-    category
-):
+def get_stats(member_id, category):
+    ensure_user(member_id)
 
-    ensure_user(
-        member_id
-    )
-
-
-    return db_execute(
-        """
+    return db_execute("""
         SELECT *
-
         FROM CategoryData
-
         WHERE discordID = ?
         AND category = ?
-        """,
-        (
-            member_id,
-            category
-        ),
-        fetchone=True
-    )
+    """, (
+        member_id,
+        category
+    ), fetchone=True)
 
 
-def set_elo(
-    member_id,
-    category,
-    elo
-):
+def set_elo(member_id, category, elo):
+    ensure_user(member_id)
 
-    ensure_user(
-        member_id
-    )
+    elo = max(0, int(elo))
 
-
-    elo = max(
-        0,
-        int(elo)
-    )
-
-
-    db_execute(
-        """
+    db_execute("""
         UPDATE CategoryData
-
         SET
             elo = ?,
             peak_elo = MAX(peak_elo, ?)
-
         WHERE discordID = ?
         AND category = ?
-        """,
-        (
-            elo,
-            elo,
-            member_id,
-            category
-        ),
-        commit=True
-    )
+    """, (
+        elo,
+        elo,
+        member_id,
+        category
+    ), commit=True)
 
 
 def update_stats(
@@ -472,17 +367,12 @@ def update_stats(
     streak=None,
     peak=None
 ):
-
-    ensure_user(
-        member_id
-    )
-
+    ensure_user(member_id)
 
     current = get_stats(
         member_id,
         category
     )
-
 
     new_elo = (
         current["elo"]
@@ -490,13 +380,11 @@ def update_stats(
         else max(0, int(elo))
     )
 
-
     new_wins = (
         current["wins"]
         if wins is None
         else int(wins)
     )
-
 
     new_losses = (
         current["losses"]
@@ -504,98 +392,75 @@ def update_stats(
         else int(losses)
     )
 
-
     new_streak = (
         current["current_streak"]
         if streak is None
         else int(streak)
     )
 
+    requested_peak = (
+        current["peak_elo"]
+        if peak is None
+        else int(peak)
+    )
 
     new_peak = max(
         current["peak_elo"],
-        new_elo if peak is None else int(peak)
+        requested_peak,
+        new_elo
     )
 
-
-    db_execute(
-        """
+    db_execute("""
         UPDATE CategoryData
-
         SET
             elo = ?,
             wins = ?,
             losses = ?,
             current_streak = ?,
             peak_elo = ?
-
         WHERE discordID = ?
         AND category = ?
-        """,
-        (
-            new_elo,
-            new_wins,
-            new_losses,
-            new_streak,
-            new_peak,
-            member_id,
-            category
-        ),
-        commit=True
-    )
+    """, (
+        new_elo,
+        new_wins,
+        new_losses,
+        new_streak,
+        new_peak,
+        member_id,
+        category
+    ), commit=True)
 
 
 # ============================================================
-# PROFILE RESET SYSTEM
+# PROFILE RESET
 # ============================================================
 
 def get_profile_reset(member_id):
-
-    return db_execute(
-        """
+    return db_execute("""
         SELECT *
-
         FROM ProfileResets
-
         WHERE discordID = ?
-        """,
-        (
-            member_id,
-        ),
-        fetchone=True
-    )
-
-
-def reset_profile(
-    member_id,
-    staff_id
-):
-
-    ensure_user(
+    """, (
         member_id
-    )
+    ), fetchone=True)
 
+
+def reset_profile(member_id, staff_id):
+    ensure_user(member_id)
 
     reset_time = datetime.now(
         timezone.utc
     ).isoformat()
 
-
     old_elos = {}
 
-
     with db_lock:
-
         cursor = connection.cursor()
 
-
         for category in CATEGORY_ROLES:
-
             row = cursor.execute("""
                 SELECT elo
-
                 FROM CategoryData
-
                 WHERE discordID = ?
                 AND category = ?
             """, (
@@ -603,35 +468,26 @@ def reset_profile(
                 category
             )).fetchone()
 
-
-            if row:
-
-                old_elos[category] = int(
-                    row["elo"]
-                )
-
-            else:
-
-                old_elos[category] = 400
-
+            old_elos[category] = (
+                int(row["elo"])
+                if row
+                else 400
+            )
 
             cursor.execute("""
                 UPDATE CategoryData
-
                 SET
                     elo = 400,
                     wins = 0,
                     losses = 0,
                     current_streak = 0,
                     peak_elo = 400
-
                 WHERE discordID = ?
                 AND category = ?
             """, (
                 member_id,
                 category
             ))
-
 
         cursor.execute("""
             INSERT INTO ProfileResets
@@ -640,11 +496,9 @@ def reset_profile(
                 reset_at,
                 reset_by
             )
-
             VALUES (?, ?, ?)
 
             ON CONFLICT(discordID)
-
             DO UPDATE SET
                 reset_at = excluded.reset_at,
                 reset_by = excluded.reset_by
@@ -654,14 +508,9 @@ def reset_profile(
             staff_id
         ))
 
-
         connection.commit()
 
-
-    return (
-        reset_time,
-        old_elos
-    )
+    return reset_time, old_elos
 
 
 # ============================================================
@@ -669,11 +518,10 @@ def reset_profile(
 # ============================================================
 
 def get_rank(elo):
+    elo = int(elo)
 
-    if elo >= 2800:
-
+    if elo >= 2400:
         return "S-Tier"
-
 
     for rank, (
         minimum,
@@ -681,77 +529,53 @@ def get_rank(elo):
     ) in reversed(
         list(AUTOMATIC_RANKS.items())
     ):
-
         if minimum <= elo <= maximum:
-
             return rank
-
 
     return "Unranked"
 
 
-def get_manual_rank(
-    member,
-    category
-):
-
-    role_ids = TIER_ROLE_IDS[
-        category
-    ]
-
+def get_manual_rank(member, category):
+    role_ids = TIER_ROLE_IDS[category]
 
     sss_role = member.guild.get_role(
         role_ids["SSS-Tier"]
     )
-
 
     if (
         sss_role
         and
         sss_role in member.roles
     ):
-
         return "SSS-Tier"
-
 
     ss_role = member.guild.get_role(
         role_ids["SS-Tier"]
     )
-
 
     if (
         ss_role
         and
         ss_role in member.roles
     ):
-
         return "SS-Tier"
-
 
     return None
 
 
-def get_display_rank(
-    member,
-    category
-):
-
+def get_display_rank(member, category):
     manual_rank = get_manual_rank(
         member,
         category
     )
 
-
     if manual_rank:
-
         return manual_rank
-
 
     stats = get_stats(
         member.id,
         category
     )
-
 
     return get_rank(
         stats["elo"]
@@ -762,36 +586,25 @@ def get_display_rank(
 # PERMISSIONS
 # ============================================================
 
-def has_role(
-    member,
-    role_id
-):
-
+def has_role(member, role_id):
     role = member.guild.get_role(
         role_id
     )
 
-
-    if role is None:
-
-        return False
-
-
-    return role in member.roles
+    return (
+        role is not None
+        and
+        role in member.roles
+    )
 
 
-def has_staff_permission(
-    member
-):
-
+def has_staff_permission(member):
     return (
         has_role(
             member,
             MODERATOR_ROLE_ID
         )
-
         or
-
         has_role(
             member,
             DUELIST_STAFF_ROLE_ID
@@ -799,10 +612,7 @@ def has_staff_permission(
     )
 
 
-def has_elo_set_permission(
-    member
-):
-
+def has_elo_set_permission(member):
     return has_role(
         member,
         ELO_SET_ROLE_ID
@@ -810,7 +620,6 @@ def has_elo_set_permission(
 
 
 async def deny(ctx):
-
     await ctx.response.send_message(
         "You do not have permission to use this command.",
         ephemeral=True
@@ -826,131 +635,87 @@ async def update_category_role(
     user,
     category
 ):
+    ensure_user(user.id)
 
-    ensure_user(
-        user.id
-    )
-
-
-    stats = get_stats(
-        user.id,
-        category
-    )
-
-
-    rank = get_display_rank(
-        user,
-        category
-    )
-
-
-    role_ids = TIER_ROLE_IDS[
-        category
-    ]
-
-
-    # --------------------------------------------------------
-    # SS / SSS ARE MANUALLY CONTROLLED
-    # --------------------------------------------------------
+    role_ids = TIER_ROLE_IDS[category]
 
     manual_rank = get_manual_rank(
         user,
         category
     )
 
-
     if manual_rank:
+        target_rank = manual_rank
+    else:
+        stats = get_stats(
+            user.id,
+            category
+        )
 
-        return manual_rank
+        target_rank = get_rank(
+            stats["elo"]
+        )
 
-
-    # --------------------------------------------------------
-    # REMOVE OTHER CATEGORY TIER ROLES
-    # --------------------------------------------------------
-
+    # Remove every other tier role in this category.
     for tier_name, role_id in role_ids.items():
+        if tier_name == target_rank:
+            continue
 
         role = guild.get_role(
             role_id
         )
 
-
         if role is None:
-
             continue
 
-
-        if (
-            role in user.roles
-            and
-            tier_name != rank
-        ):
-
+        if role in user.roles:
             try:
-
                 await user.remove_roles(
                     role
                 )
-
             except discord.HTTPException as error:
-
                 print(
-                    f"Could not remove {role.name} "
-                    f"from {user}: {error}"
+                    f"Could not remove "
+                    f"{role.name} from "
+                    f"{user}: {error}"
                 )
 
-
-    # --------------------------------------------------------
-    # ADD CURRENT RANK
-    # --------------------------------------------------------
-
+    # Add the correct rank role.
     target_role = guild.get_role(
-        role_ids[rank]
+        role_ids[target_rank]
     )
 
+    if (
+        target_role
+        and
+        target_role not in user.roles
+    ):
+        try:
+            await user.add_roles(
+                target_role
+            )
+        except discord.HTTPException as error:
+            print(
+                f"Could not add "
+                f"{target_role.name} to "
+                f"{user}: {error}"
+            )
 
-    if target_role is not None:
-
-        if target_role not in user.roles:
-
-            try:
-
-                await user.add_roles(
-                    target_role
-                )
-
-            except discord.HTTPException as error:
-
-                print(
-                    f"Could not add {target_role.name} "
-                    f"to {user}: {error}"
-                )
-
-
-    return rank
+    return target_rank
 
 
 async def update_all_roles(
     guild,
     user
 ):
-
-    ensure_user(
-        user.id
-    )
-
-
     ranks = {}
 
-
     for category in CATEGORY_ROLES:
-
         ranks[category] = await update_category_role(
             guild,
             user,
             category
         )
-
 
     return ranks
 
@@ -960,9 +725,7 @@ async def update_all_roles(
 # ============================================================
 
 async def get_logs_channel():
-
     try:
-
         return await client.fetch_channel(
             LOGS_CHANNEL_ID
         )
@@ -972,22 +735,19 @@ async def get_logs_channel():
         discord.Forbidden,
         discord.HTTPException
     ):
-
         return None
 
 
 # ============================================================
-# ELO CALCULATION
+# ELO SYSTEM
 # ============================================================
 
 def probability(
     rating1,
     rating2
 ):
-
     return 1.0 / (
-        1
-        +
+        1.0 +
         math.pow(
             10,
             (rating1 - rating2) / 1500.0
@@ -1000,98 +760,78 @@ def elo_rating(
     Rb,
     outcome
 ):
+    Pa = probability(
+        Rb,
+        Ra
+    )
 
     Pb = probability(
         Ra,
         Rb
     )
 
-
-    Pa = probability(
-        Rb,
-        Ra
-    )
-
-
     rating_diff = abs(
         Ra - Rb
     )
-
 
     multiplier = pow(
         1.05,
         rating_diff // 100
     )
 
-
     if Ra < Rb:
-
-        Ra = round(
-            Ra
-            +
-            (K * multiplier)
-            *
+        new_ra = round(
+            Ra +
+            (K * multiplier) *
             (outcome - Pa)
         )
 
-
-        Rb = round(
-            Rb
-            +
-            (K * multiplier)
-            *
+        new_rb = round(
+            Rb +
+            (K * multiplier) *
             ((1 - outcome) - Pb)
         )
-
 
     else:
-
-        Ra = round(
-            Ra
-            +
-            K
-            *
+        new_ra = round(
+            Ra +
+            K *
             (outcome - Pa)
         )
 
-
-        Rb = round(
-            Rb
-            +
-            K
-            *
+        new_rb = round(
+            Rb +
+            K *
             ((1 - outcome) - Pb)
         )
 
-
     return (
-        max(0, Ra),
-        max(0, Rb)
+        max(0, new_ra),
+        max(0, new_rb)
     )
 
 
 # ============================================================
-# MATCH IDS
+# MATCH CODE
 # ============================================================
 
 def new_match_code():
-
-    row = db_execute(
-        """
+    row = db_execute("""
         SELECT
-            COALESCE(MAX(id), 0) + 1 AS next_id
-
+            COALESCE(
+                MAX(id),
+                0
+            ) + 1 AS next_id
         FROM Matches
-        """,
-        fetchone=True
+    """, fetchone=True)
+
+    return (
+        f"DUEL-{row['next_id']:05d}"
     )
 
 
-    return f"DUEL-{row['next_id']:05d}"
-
-
 # ============================================================
-# AUDIT SYSTEM
+# AUDIT
 # ============================================================
 
 def audit(
@@ -1103,9 +843,7 @@ def audit(
     match_code,
     staff_id
 ):
-
-    db_execute(
-        """
+    db_execute("""
         INSERT INTO EloAudit
         (
             discordID,
@@ -1117,23 +855,19 @@ def audit(
             staff_id,
             created_at
         )
-
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            member_id,
-            category,
-            old_elo,
-            new_elo,
-            action,
-            match_code,
-            staff_id,
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        ),
-        commit=True
-    )
+    """, (
+        member_id,
+        category,
+        old_elo,
+        new_elo,
+        action,
+        match_code,
+        staff_id,
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    ), commit=True)
 
 
 # ============================================================
@@ -1141,62 +875,51 @@ def audit(
 # ============================================================
 
 CATEGORY_CHOICES = [
-
     app_commands.Choice(
         name=category,
         value=category
     )
-
     for category in CATEGORY_ROLES
 ]
 
 
 # ============================================================
-# BOT EVENTS
+# EVENTS
 # ============================================================
 
 @client.event
 async def on_ready():
-
     create_database()
-
 
     print(
         f"{client.user} has connected to Discord."
     )
 
-
     guild = discord.Object(
         id=SERVER_ID
     )
 
-
     try:
-
         await tree.sync(
             guild=guild
         )
-
 
         print(
             "Slash commands synced."
         )
 
-
     except discord.HTTPException as error:
-
         print(
-            f"Failed to sync slash commands: {error}"
+            f"Failed to sync slash commands: "
+            f"{error}"
         )
 
 
 @client.event
 async def on_member_join(member):
-
     ensure_user(
         member.id
     )
-
 
     await update_all_roles(
         member.guild,
@@ -1211,52 +934,45 @@ async def on_member_join(member):
 @tree.command(
     name="elo_set",
     description="Set a user's ELO.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user whose ELO you want to set.",
     category="The category.",
     elo="The new ELO."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def elo_set(
     ctx,
     member: discord.Member,
     category: str,
     elo: int
 ):
-
     if not has_elo_set_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
-
 
     old_elo = get_stats(
         member.id,
         category
     )["elo"]
 
-
     new_elo = max(
         0,
         elo
     )
-
 
     set_elo(
         member.id,
         category,
         new_elo
     )
-
 
     audit(
         member.id,
@@ -1268,17 +984,16 @@ async def elo_set(
         ctx.user.id
     )
 
-
     rank = await update_category_role(
         ctx.guild,
         member,
         category
     )
 
-
     await ctx.response.send_message(
-        f"{member.mention}'s **{category}** ELO "
-        f"was set to **{new_elo}**.\n"
+        f"{member.mention}'s "
+        f"**{category}** ELO was set to "
+        f"**{new_elo}**.\n"
         f"Rank: **{rank}**"
     )
 
@@ -1290,59 +1005,51 @@ async def elo_set(
 @tree.command(
     name="elo_add",
     description="Add ELO to a user.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user.",
     category="The category.",
     elo="The amount of ELO to add."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def elo_add(
     ctx,
     member: discord.Member,
     category: str,
     elo: int
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
 
-
     if elo < 0:
-
         await ctx.response.send_message(
             "ELO amount cannot be negative.",
             ephemeral=True
         )
-
         return
-
 
     old_elo = get_stats(
         member.id,
         category
     )["elo"]
 
-
-    new_elo = old_elo + elo
-
+    new_elo = (
+        old_elo + elo
+    )
 
     set_elo(
         member.id,
         category,
         new_elo
     )
-
 
     audit(
         member.id,
@@ -1354,17 +1061,16 @@ async def elo_add(
         ctx.user.id
     )
 
-
     rank = await update_category_role(
         ctx.guild,
         member,
         category
     )
 
-
     await ctx.response.send_message(
         f"Added **{elo} ELO** to "
-        f"{member.mention}'s **{category}** rating.\n"
+        f"{member.mention}'s "
+        f"**{category}** rating.\n"
         f"**{old_elo} → {new_elo}**\n"
         f"Rank: **{rank}**"
     )
@@ -1377,62 +1083,52 @@ async def elo_add(
 @tree.command(
     name="elo_remove",
     description="Remove ELO from a user.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user.",
     category="The category.",
     elo="The amount of ELO to remove."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def elo_remove(
     ctx,
     member: discord.Member,
     category: str,
     elo: int
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
 
-
     if elo < 0:
-
         await ctx.response.send_message(
             "ELO amount cannot be negative.",
             ephemeral=True
         )
-
         return
-
 
     old_elo = get_stats(
         member.id,
         category
     )["elo"]
 
-
     new_elo = max(
         0,
         old_elo - elo
     )
-
 
     set_elo(
         member.id,
         category,
         new_elo
     )
-
 
     audit(
         member.id,
@@ -1444,17 +1140,16 @@ async def elo_remove(
         ctx.user.id
     )
 
-
     rank = await update_category_role(
         ctx.guild,
         member,
         category
     )
 
-
     await ctx.response.send_message(
         f"Removed **{elo} ELO** from "
-        f"{member.mention}'s **{category}** rating.\n"
+        f"{member.mention}'s "
+        f"**{category}** rating.\n"
         f"**{old_elo} → {new_elo}**\n"
         f"Rank: **{rank}**"
     )
@@ -1467,38 +1162,39 @@ async def elo_remove(
 @tree.command(
     name="elo_check",
     description="Check a user's ELO.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     category="The category.",
     member="The user."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def elo_check(
     ctx,
     category: str,
-    member: Optional[discord.Member] = None
+    member: Optional[
+        discord.Member
+    ] = None
 ):
-
-    member = member or ctx.user
-
+    member = (
+        member
+        or
+        ctx.user
+    )
 
     stats = get_stats(
         member.id,
         category
     )
 
-
     rank = get_display_rank(
         member,
         category
     )
-
 
     await ctx.response.send_message(
         f"{member.mention}\n"
@@ -1515,47 +1211,40 @@ async def elo_check(
 @tree.command(
     name="elo_preview",
     description="Preview the ELO change for a match.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     winner="The winner.",
     loser="The loser.",
     category="The category."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def elo_preview(
     ctx,
     winner: discord.Member,
     loser: discord.Member,
     category: str
 ):
-
     if winner.id == loser.id:
-
         await ctx.response.send_message(
             "Winner and loser must be different users.",
             ephemeral=True
         )
-
         return
-
 
     winner_stats = get_stats(
         winner.id,
         category
     )
 
-
     loser_stats = get_stats(
         loser.id,
         category
     )
-
 
     winner_after, loser_after = elo_rating(
         winner_stats["elo"],
@@ -1563,146 +1252,44 @@ async def elo_preview(
         1
     )
 
-
     await ctx.response.send_message(
         f"**{category} ELO Preview**\n\n"
         f"{winner.mention}: "
-        f"**{winner_stats['elo']} → {winner_after}** "
+        f"**{winner_stats['elo']} → "
+        f"{winner_after}** "
         f"({winner_after - winner_stats['elo']:+d})\n"
         f"{loser.mention}: "
-        f"**{loser_stats['elo']} → {loser_after}** "
+        f"**{loser_stats['elo']} → "
+        f"{loser_after}** "
         f"({loser_after - loser_stats['elo']:+d})"
     )
 
 
 # ============================================================
-# /SUBMIT_MATCH
+# MATCH HELPERS
 # ============================================================
 
-@tree.command(
-    name="submit_match",
-    description="Submit a standard match.",
-    guild=discord.Object(id=SERVER_ID)
-)
-
-@app_commands.describe(
-    winner="The winner.",
-    loser="The loser.",
-    category="The category.",
-    proof="Proof of the duel."
-)
-
-@app_commands.choices(
-    category=CATEGORY_CHOICES
-)
-
-async def submit_match(
-    ctx,
-    winner: discord.Member,
-    loser: discord.Member,
-    category: str,
-    proof: str
+def insert_match(
+    match_code,
+    category,
+    winner,
+    loser,
+    winner_before,
+    winner_after,
+    loser_before,
+    loser_after,
+    winner_stats,
+    loser_stats,
+    proof,
+    submitted_by,
+    match_type,
+    created_at
 ):
-
-    if not has_staff_permission(
-        ctx.user
-    ):
-
-        await deny(ctx)
-        return
-
-
-    if winner.id == loser.id:
-
-        await ctx.response.send_message(
-            "Winner and loser must be different users.",
-            ephemeral=True
-        )
-
-        return
-
-
-    winner_stats = get_stats(
-        winner.id,
-        category
-    )
-
-
-    loser_stats = get_stats(
-        loser.id,
-        category
-    )
-
-
-    winner_before = winner_stats["elo"]
-    loser_before = loser_stats["elo"]
-
-
-    winner_after, loser_after = elo_rating(
-        winner_before,
-        loser_before,
-        1
-    )
-
-
-    match_code = new_match_code()
-
-
-    created_at = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-    duplicate = db_execute(
-        """
-        SELECT match_code
-
-        FROM Matches
-
-        WHERE category = ?
-
-        AND undone = 0
-
-        AND (
-            (winner_id = ? AND loser_id = ?)
-            OR
-            (winner_id = ? AND loser_id = ?)
-        )
-
-        AND created_at >= datetime('now', '-60 seconds')
-
-        LIMIT 1
-        """,
-        (
-            category,
-            winner.id,
-            loser.id,
-            loser.id,
-            winner.id
-        ),
-        fetchone=True
-    )
-
-
-    if duplicate:
-
-        await ctx.response.send_message(
-            f"A very recent match already exists for these "
-            f"players: **{duplicate['match_code']}**.\n"
-            f"If this is a separate duel, wait before submitting it.",
-            ephemeral=True
-        )
-
-        return
-
-
-    db_execute(
-        """
+    db_execute("""
         INSERT INTO Matches
         (
             match_code,
             category,
-
             winner_id,
             loser_id,
 
@@ -1726,70 +1313,259 @@ async def submit_match(
             created_at,
             undone
         )
-
         VALUES
         (
             ?, ?, ?, ?,
-            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?,
             ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?, ?, 0
         )
-        """,
-        (
-            match_code,
-            category,
+    """, (
+        match_code,
+        category,
+        winner.id,
+        loser.id,
 
-            winner.id,
-            loser.id,
+        winner_before,
+        winner_after,
 
-            winner_before,
-            winner_after,
+        loser_before,
+        loser_after,
 
-            loser_before,
-            loser_after,
+        winner_stats["wins"],
+        winner_stats["losses"],
+        winner_stats["current_streak"],
 
-            winner_stats["wins"],
-            winner_stats["losses"],
-            winner_stats["current_streak"],
+        loser_stats["wins"],
+        loser_stats["losses"],
+        loser_stats["current_streak"],
 
-            loser_stats["wins"],
-            loser_stats["losses"],
-            loser_stats["current_streak"],
-
-            proof,
-            ctx.user.id,
-
-            "Standard",
-            created_at
-        ),
-        commit=True
-    )
+        proof,
+        submitted_by,
+        match_type,
+        created_at
+    ), commit=True)
 
 
+def apply_match_stats(
+    winner,
+    loser,
+    category,
+    winner_after,
+    loser_after,
+    winner_stats,
+    loser_stats
+):
     update_stats(
         winner.id,
         category,
-
         elo=winner_after,
-        wins=winner_stats["wins"] + 1,
+        wins=(
+            winner_stats["wins"] + 1
+        ),
         losses=winner_stats["losses"],
-        streak=winner_stats["current_streak"] + 1,
+        streak=(
+            winner_stats["current_streak"] + 1
+        ),
         peak=winner_after
     )
-
 
     update_stats(
         loser.id,
         category,
-
         elo=loser_after,
         wins=loser_stats["wins"],
-        losses=loser_stats["losses"] + 1,
+        losses=(
+            loser_stats["losses"] + 1
+        ),
         streak=0,
         peak=loser_stats["peak_elo"]
     )
 
+
+async def log_match(
+    category,
+    match_code,
+    winner,
+    loser,
+    winner_before,
+    winner_after,
+    loser_before,
+    loser_after,
+    proof,
+    submitted_by,
+    match_type
+):
+    embed = discord.Embed(
+        title=f"Match {match_code}",
+        description=(
+            f"**Category:** {category}\n"
+            f"**Type:** {match_type}\n\n"
+
+            f"**Winner:** {winner.mention}\n"
+            f"ELO: **{winner_before} → "
+            f"{winner_after}** "
+            f"({winner_after - winner_before:+d})\n\n"
+
+            f"**Loser:** {loser.mention}\n"
+            f"ELO: **{loser_before} → "
+            f"{loser_after}** "
+            f"({loser_after - loser_before:+d})\n\n"
+
+            f"**Proof:** {proof}\n"
+            f"**Submitted by:** "
+            f"{submitted_by.mention}"
+        )
+    )
+
+    logs = await get_logs_channel()
+
+    if logs:
+        await logs.send(
+            embed=embed
+        )
+
+    return embed
+
+
+# ============================================================
+# /SUBMIT_MATCH
+# ============================================================
+
+@tree.command(
+    name="submit_match",
+    description="Submit a standard match.",
+    guild=discord.Object(
+        id=SERVER_ID
+    )
+)
+@app_commands.describe(
+    winner="The winner.",
+    loser="The loser.",
+    category="The category.",
+    proof="Proof of the duel."
+)
+@app_commands.choices(
+    category=CATEGORY_CHOICES
+)
+async def submit_match(
+    ctx,
+    winner: discord.Member,
+    loser: discord.Member,
+    category: str,
+    proof: str
+):
+    if not has_staff_permission(
+        ctx.user
+    ):
+        await deny(ctx)
+        return
+
+    if winner.id == loser.id:
+        await ctx.response.send_message(
+            "Winner and loser must be different users.",
+            ephemeral=True
+        )
+        return
+
+    winner_stats = get_stats(
+        winner.id,
+        category
+    )
+
+    loser_stats = get_stats(
+        loser.id,
+        category
+    )
+
+    winner_before = (
+        winner_stats["elo"]
+    )
+
+    loser_before = (
+        loser_stats["elo"]
+    )
+
+    winner_after, loser_after = elo_rating(
+        winner_before,
+        loser_before,
+        1
+    )
+
+    # Prevent accidental duplicate submissions
+    # within 60 seconds.
+    duplicate = db_execute("""
+        SELECT match_code
+        FROM Matches
+        WHERE category = ?
+        AND undone = 0
+        AND (
+            (
+                winner_id = ?
+                AND loser_id = ?
+            )
+            OR
+            (
+                winner_id = ?
+                AND loser_id = ?
+            )
+        )
+        AND created_at >= datetime(
+            'now',
+            '-60 seconds'
+        )
+        LIMIT 1
+    """, (
+        category,
+        winner.id,
+        loser.id,
+        loser.id,
+        winner.id
+    ), fetchone=True)
+
+    if duplicate:
+        await ctx.response.send_message(
+            f"A very recent match already exists "
+            f"for these players: "
+            f"**{duplicate['match_code']}**.",
+            ephemeral=True
+        )
+        return
+
+    match_code = new_match_code()
+
+    created_at = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    insert_match(
+        match_code,
+        category,
+        winner,
+        loser,
+        winner_before,
+        winner_after,
+        loser_before,
+        loser_after,
+        winner_stats,
+        loser_stats,
+        proof,
+        ctx.user.id,
+        "Standard",
+        created_at
+    )
+
+    apply_match_stats(
+        winner,
+        loser,
+        category,
+        winner_after,
+        loser_after,
+        winner_stats,
+        loser_stats
+    )
 
     audit(
         winner.id,
@@ -1801,7 +1577,6 @@ async def submit_match(
         ctx.user.id
     )
 
-
     audit(
         loser.id,
         category,
@@ -1812,13 +1587,11 @@ async def submit_match(
         ctx.user.id
     )
 
-
     await update_category_role(
         ctx.guild,
         winner,
         category
     )
-
 
     await update_category_role(
         ctx.guild,
@@ -1826,39 +1599,23 @@ async def submit_match(
         category
     )
 
-
-    embed = discord.Embed(
-        title=f"Match {match_code}",
-        description=(
-            f"**Category:** {category}\n\n"
-
-            f"**Winner:** {winner.mention}\n"
-            f"ELO: **{winner_before} → {winner_after}** "
-            f"({winner_after - winner_before:+d})\n\n"
-
-            f"**Loser:** {loser.mention}\n"
-            f"ELO: **{loser_before} → {loser_after}** "
-            f"({loser_after - loser_before:+d})\n\n"
-
-            f"**Proof:** {proof}\n"
-            f"**Submitted by:** {ctx.user.mention}"
-        )
+    embed = await log_match(
+        category,
+        match_code,
+        winner,
+        loser,
+        winner_before,
+        winner_after,
+        loser_before,
+        loser_after,
+        proof,
+        ctx.user,
+        "Standard"
     )
-
 
     await ctx.response.send_message(
         embed=embed
     )
-
-
-    logs = await get_logs_channel()
-
-
-    if logs:
-
-        await logs.send(
-            embed=embed
-        )
 
 
 # ============================================================
@@ -1868,9 +1625,10 @@ async def submit_match(
 @tree.command(
     name="submit_tiered_match",
     description="Submit a tiered match.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     winner="The winner.",
     loser="The loser.",
@@ -1878,7 +1636,6 @@ async def submit_match(
     proof="Proof of the duel.",
     challengerstatus="Whether the challenger won or lost."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES,
 
@@ -1887,14 +1644,12 @@ async def submit_match(
             name="Challenger Won",
             value="won"
         ),
-
         app_commands.Choice(
             name="Challenger Lost",
             value="lost"
         )
     ]
 )
-
 async def submit_tiered_match(
     ctx,
     winner: discord.Member,
@@ -1903,185 +1658,103 @@ async def submit_tiered_match(
     proof: str,
     challengerstatus: str
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
 
-
     if winner.id == loser.id:
-
         await ctx.response.send_message(
             "Winner and loser must be different users.",
             ephemeral=True
         )
-
         return
-
 
     winner_stats = get_stats(
         winner.id,
         category
     )
 
-
     loser_stats = get_stats(
         loser.id,
         category
     )
 
+    winner_before = (
+        winner_stats["elo"]
+    )
 
-    winner_before = winner_stats["elo"]
-    loser_before = loser_stats["elo"]
-
+    loser_before = (
+        loser_stats["elo"]
+    )
 
     loser_rank = get_display_rank(
         loser,
         category
     )
 
-
     if (
         challengerstatus == "won"
         and
         loser_rank in PLACEMENT_ELO
     ):
-
         winner_after = PLACEMENT_ELO[
             loser_rank
         ]
-
 
         loser_after = max(
             0,
             loser_before - 250
         )
 
-
         match_type = (
             "Tiered - Challenger Won"
         )
 
-
     else:
-
         winner_after, loser_after = elo_rating(
             winner_before,
             loser_before,
             1
         )
 
-
         match_type = (
             "Tiered - Challenger Lost"
         )
 
-
     match_code = new_match_code()
-
 
     created_at = datetime.now(
         timezone.utc
     ).isoformat()
 
-
-    db_execute(
-        """
-        INSERT INTO Matches
-        (
-            match_code,
-            category,
-
-            winner_id,
-            loser_id,
-
-            winner_elo_before,
-            winner_elo_after,
-
-            loser_elo_before,
-            loser_elo_after,
-
-            winner_wins_before,
-            winner_losses_before,
-            winner_streak_before,
-
-            loser_wins_before,
-            loser_losses_before,
-            loser_streak_before,
-
-            proof,
-            submitted_by,
-            match_type,
-            created_at,
-            undone
-        )
-
-        VALUES
-        (
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?, 0
-        )
-        """,
-        (
-            match_code,
-            category,
-
-            winner.id,
-            loser.id,
-
-            winner_before,
-            winner_after,
-
-            loser_before,
-            loser_after,
-
-            winner_stats["wins"],
-            winner_stats["losses"],
-            winner_stats["current_streak"],
-
-            loser_stats["wins"],
-            loser_stats["losses"],
-            loser_stats["current_streak"],
-
-            proof,
-            ctx.user.id,
-
-            match_type,
-            created_at
-        ),
-        commit=True
-    )
-
-
-    update_stats(
-        winner.id,
+    insert_match(
+        match_code,
         category,
-
-        elo=winner_after,
-        wins=winner_stats["wins"] + 1,
-        losses=winner_stats["losses"],
-        streak=winner_stats["current_streak"] + 1,
-        peak=winner_after
+        winner,
+        loser,
+        winner_before,
+        winner_after,
+        loser_before,
+        loser_after,
+        winner_stats,
+        loser_stats,
+        proof,
+        ctx.user.id,
+        match_type,
+        created_at
     )
 
-
-    update_stats(
-        loser.id,
+    apply_match_stats(
+        winner,
+        loser,
         category,
-
-        elo=loser_after,
-        wins=loser_stats["wins"],
-        losses=loser_stats["losses"] + 1,
-        streak=0,
-        peak=loser_stats["peak_elo"]
+        winner_after,
+        loser_after,
+        winner_stats,
+        loser_stats
     )
-
 
     audit(
         winner.id,
@@ -2093,7 +1766,6 @@ async def submit_tiered_match(
         ctx.user.id
     )
 
-
     audit(
         loser.id,
         category,
@@ -2104,13 +1776,11 @@ async def submit_tiered_match(
         ctx.user.id
     )
 
-
     await update_category_role(
         ctx.guild,
         winner,
         category
     )
-
 
     await update_category_role(
         ctx.guild,
@@ -2118,38 +1788,72 @@ async def submit_tiered_match(
         category
     )
 
-
-    embed = discord.Embed(
-        title=f"Tiered Match {match_code}",
-        description=(
-            f"**Category:** {category}\n"
-            f"**Type:** {match_type}\n\n"
-
-            f"**Winner:** {winner.mention}\n"
-            f"ELO: **{winner_before} → {winner_after}**\n\n"
-
-            f"**Loser:** {loser.mention}\n"
-            f"ELO: **{loser_before} → {loser_after}**\n\n"
-
-            f"**Proof:** {proof}\n"
-            f"**Submitted by:** {ctx.user.mention}"
-        )
+    embed = await log_match(
+        category,
+        match_code,
+        winner,
+        loser,
+        winner_before,
+        winner_after,
+        loser_before,
+        loser_after,
+        proof,
+        ctx.user,
+        match_type
     )
-
 
     await ctx.response.send_message(
         embed=embed
     )
 
 
-    logs = await get_logs_channel()
+# ============================================================
+# LEADERBOARD
+# ============================================================
 
+async def send_leaderboard(
+    ctx,
+    category
+):
+    rows = db_execute("""
+        SELECT
+            discordID,
+            elo,
+            wins,
+            losses
+        FROM CategoryData
+        WHERE category = ?
+        ORDER BY elo DESC
+        LIMIT 10
+    """, (
+        category
+    ), fetchall=True)
 
-    if logs:
-
-        await logs.send(
-            embed=embed
+    if not rows:
+        await ctx.response.send_message(
+            "No players found."
         )
+        return
+
+    lines = []
+
+    for index, row in enumerate(
+        rows,
+        start=1
+    ):
+        lines.append(
+            f"**{index}.** "
+            f"<@{row['discordID']}> — "
+            f"**{row['elo']} ELO** "
+            f"({row['wins']}W / "
+            f"{row['losses']}L)"
+        )
+
+    await ctx.response.send_message(
+        f"**{category} Leaderboard**\n\n"
+        +
+        "\n".join(lines)
+    )
 
 
 # ============================================================
@@ -2159,74 +1863,23 @@ async def submit_tiered_match(
 @tree.command(
     name="leaderboard",
     description="Check the category leaderboard.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     category="The category."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def leaderboard(
     ctx,
     category: str
 ):
-
-    rows = db_execute(
-        """
-        SELECT
-            discordID,
-            elo,
-            wins,
-            losses
-
-        FROM CategoryData
-
-        WHERE category = ?
-
-        ORDER BY elo DESC
-
-        LIMIT 10
-        """,
-        (
-            category,
-        ),
-        fetchall=True
-    )
-
-
-    if not rows:
-
-        await ctx.response.send_message(
-            "No players found."
-        )
-
-        return
-
-
-    lines = []
-
-
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
-
-        lines.append(
-            f"**{index}.** "
-            f"<@{row['discordID']}> — "
-            f"**{row['elo']} ELO** "
-            f"({row['wins']}W / {row['losses']}L)"
-        )
-
-
-    await ctx.response.send_message(
-        f"**{category} Leaderboard**\n\n"
-        +
-        "\n".join(lines)
+    await send_leaderboard(
+        ctx,
+        category
     )
 
 
@@ -2237,74 +1890,23 @@ async def leaderboard(
 @tree.command(
     name="check_leaderboard",
     description="Check the current standings.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     category="The category."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def check_leaderboard(
     ctx,
     category: str
 ):
-
-    rows = db_execute(
-        """
-        SELECT
-            discordID,
-            elo,
-            wins,
-            losses
-
-        FROM CategoryData
-
-        WHERE category = ?
-
-        ORDER BY elo DESC
-
-        LIMIT 10
-        """,
-        (
-            category,
-        ),
-        fetchall=True
-    )
-
-
-    if not rows:
-
-        await ctx.response.send_message(
-            "No players found."
-        )
-
-        return
-
-
-    lines = []
-
-
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
-
-        lines.append(
-            f"**{index}.** "
-            f"<@{row['discordID']}> — "
-            f"**{row['elo']} ELO** "
-            f"({row['wins']}W / {row['losses']}L)"
-        )
-
-
-    await ctx.response.send_message(
-        f"**{category} Leaderboard**\n\n"
-        +
-        "\n".join(lines)
+    await send_leaderboard(
+        ctx,
+        category
     )
 
 
@@ -2315,44 +1917,45 @@ async def check_leaderboard(
 @tree.command(
     name="profile",
     description="Show a player's competitive profile.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user."
 )
-
 async def profile(
     ctx,
-    member: Optional[discord.Member] = None
+    member: Optional[
+        discord.Member
+    ] = None
 ):
-
-    member = member or ctx.user
-
+    member = (
+        member
+        or
+        ctx.user
+    )
 
     ensure_user(
         member.id
     )
 
-
     embed = discord.Embed(
-        title=f"{member.display_name}'s Profile"
+        title=(
+            f"{member.display_name}'s Profile"
+        )
     )
 
-
     for category in CATEGORY_ROLES:
-
         stats = get_stats(
             member.id,
             category
         )
 
-
         rank = get_display_rank(
             member,
             category
         )
-
 
         total_matches = (
             stats["wins"]
@@ -2360,9 +1963,7 @@ async def profile(
             stats["losses"]
         )
 
-
         if total_matches > 0:
-
             winrate = (
                 stats["wins"]
                 /
@@ -2370,30 +1971,27 @@ async def profile(
                 *
                 100
             )
-
         else:
-
             winrate = 0
-
 
         embed.add_field(
             name=category,
-
             value=(
                 f"**ELO:** {stats['elo']}\n"
                 f"**Rank:** {rank}\n"
                 f"**Wins:** {stats['wins']}\n"
                 f"**Losses:** {stats['losses']}\n"
-                f"**Win Rate:** {winrate:.1f}%\n"
+                f"**Win Rate:** "
+                f"{winrate:.1f}%\n"
                 f"**Current Win Streak:** "
                 f"{stats['current_streak']}\n"
-                f"**Peak ELO:** {stats['peak_elo']}\n"
-                f"**Matches:** {total_matches}"
+                f"**Peak ELO:** "
+                f"{stats['peak_elo']}\n"
+                f"**Matches:** "
+                f"{total_matches}"
             ),
-
             inline=False
         )
-
 
     await ctx.response.send_message(
         embed=embed
@@ -2407,7 +2005,9 @@ async def profile(
 @tree.command(
     name="profile_reset",
     description="Completely reset a player's competitive profile.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
 @app_commands.describe(
     member="The user whose profile you want to reset."
@@ -2416,13 +2016,12 @@ async def profile_reset(
     ctx,
     member: discord.Member
 ):
-
-    # ONLY ROLE 1510774088354762915 CAN USE THIS
-    if not has_elo_set_permission(ctx.user):
+    if not has_elo_set_permission(
+        ctx.user
+    ):
         await deny(ctx)
         return
 
-    # Do not allow bot profiles to be reset
     if member.bot:
         await ctx.response.send_message(
             "You cannot reset a bot's profile.",
@@ -2430,27 +2029,9 @@ async def profile_reset(
         )
         return
 
-    # --------------------------------------------------------
-    # CONFIRMATION VIEW
-    # --------------------------------------------------------
-
     view = discord.ui.View(
         timeout=30
     )
-
-    async def check_user(interaction):
-
-        if interaction.user.id != ctx.user.id:
-            await interaction.response.send_message(
-                "Only the staff member who started this reset "
-                "can confirm it.",
-                ephemeral=True
-            )
-            return False
-
-        return True
-
-    view.interaction_check = check_user
 
     confirm_button = discord.ui.Button(
         label="Confirm Reset",
@@ -2462,85 +2043,103 @@ async def profile_reset(
         style=discord.ButtonStyle.secondary
     )
 
-    # --------------------------------------------------------
-    # CONFIRM RESET
-    # --------------------------------------------------------
+    async def interaction_check(
+        interaction
+    ):
+        if (
+            interaction.user.id
+            !=
+            ctx.user.id
+        ):
+            await interaction.response.send_message(
+                "Only the staff member who started "
+                "this reset can confirm it.",
+                ephemeral=True
+            )
 
-    async def confirm_callback(interaction):
+            return False
 
-        reset_time, old_elos = reset_profile(
+        return True
+
+    view.interaction_check = (
+        interaction_check
+    )
+
+    async def confirm_callback(
+        interaction
+    ):
+        _, old_elos = reset_profile(
             member.id,
             ctx.user.id
         )
 
         role_errors = 0
 
-        # ----------------------------------------------------
-        # REMOVE ALL TIER ROLES AND GIVE UNRANKED
-        # ----------------------------------------------------
+        # Get every tier role once.
+        all_tier_roles = set()
 
         for category in CATEGORY_ROLES:
+            all_tier_roles.update(
+                TIER_ROLE_IDS[
+                    category
+                ].values()
+            )
 
-            role_ids = TIER_ROLE_IDS[category]
-
-            for tier_name, role_id in role_ids.items():
-
-                role = ctx.guild.get_role(
-                    role_id
-                )
-
-                if role is None:
-                    continue
-
-                if role in member.roles:
-
-                    try:
-                        await member.remove_roles(
-                            role
-                        )
-
-                    except discord.HTTPException as error:
-
-                        role_errors += 1
-
-                        print(
-                            f"Could not remove {role.name} "
-                            f"from {member}: {error}"
-                        )
-
-            # ------------------------------------------------
-            # ADD UNRANKED ROLE
-            # ------------------------------------------------
-
-            unranked_role = ctx.guild.get_role(
-                role_ids["Unranked"]
+        # Remove all tier roles.
+        for role_id in all_tier_roles:
+            role = ctx.guild.get_role(
+                role_id
             )
 
             if (
-                unranked_role
-                and
-                unranked_role not in member.roles
+                role is None
+                or
+                role not in member.roles
             ):
+                continue
 
-                try:
+            try:
+                await member.remove_roles(
+                    role
+                )
 
-                    await member.add_roles(
-                        unranked_role
-                    )
+            except discord.HTTPException as error:
+                role_errors += 1
 
-                except discord.HTTPException as error:
+                print(
+                    f"Could not remove "
+                    f"{role.name} from "
+                    f"{member}: {error}"
+                )
 
-                    role_errors += 1
+        # Give Unranked.
+        unranked_role = ctx.guild.get_role(
+            TIER_ROLE_IDS[
+                "Duelist"
+            ]["Unranked"]
+        )
 
-                    print(
-                        f"Could not add {unranked_role.name} "
-                        f"to {member}: {error}"
-                    )
+        if (
+            unranked_role
+            and
+            unranked_role not in member.roles
+        ):
+            try:
+                await member.add_roles(
+                    unranked_role
+                )
 
-            # ------------------------------------------------
-            # AUDIT RESET
-            # ------------------------------------------------
+            except discord.HTTPException as error:
+                role_errors += 1
 
+                print(
+                    f"Could not add "
+                    f"{unranked_role.name} to "
+                    f"{member}: {error}"
+                )
+
+        # Audit each category.
+        for category in CATEGORY_ROLES:
             audit(
                 member.id,
                 category,
@@ -2551,210 +2150,12 @@ async def profile_reset(
                 ctx.user.id
             )
 
-        # ----------------------------------------------------
-        # LOG RESET
-        # ----------------------------------------------------
-
         reset_embed = discord.Embed(
             title="Profile Reset",
             description=(
                 f"**User:** {member.mention}\n"
-                f"**Reset by:** {ctx.user.mention}\n\n"
-                f"**Duelist:** "
-                f"{old_elos['Duelist']} → 400\n"
-                f"**Soldier:** "
-                f"{old_elos['Soldier']} → 400\n"
-                f"**Aether Wielder:** "
-                f"{old_elos['Aether Wielder']} → 400"
-            )
-        )
-
-        logs = await get_logs_channel()
-
-        if logs:
-            await logs.send(
-                embed=reset_embed
-            )
-
-        # ----------------------------------------------------
-        # DISABLE BUTTONS
-        # ----------------------------------------------------
-
-        confirm_button.disabled = True
-        cancel_button.disabled = True
-
-        # ----------------------------------------------------
-        # RESULT MESSAGE
-        # ----------------------------------------------------
-
-        if role_errors:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All ELO and stats were reset to **400/0**.\n"
-                f"Old match history remains stored but is hidden "
-                f"from the reset profile.\n\n"
-                f"⚠️ {role_errors} role update(s) failed. "
-                f"Check the bot's role hierarchy."
-            )
-
-        else:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All categories are now **400 ELO** and **Unranked**.\n"
-                f"Wins, losses, streaks and peak ELO were reset.\n"
-                f"Previous match history remains stored but is hidden "
-                f"from the reset profile."
-            )
-
-        await interaction.response.edit_message(
-            content=result_text,
-            view=view
-        )
-
-        view.stop()
-
-    # --------------------------------------------------------
-    # CANCEL RESET
-    # --------------------------------------------------------
-
-    async def cancel_callback(interaction):
-
-        confirm_button.disabled = True
-        cancel_button.disabled = True
-
-        await interaction.response.edit_message(
-            content="Profile reset cancelled.",
-            view=view
-        )
-
-        view.stop()
-
-    confirm_button.callback = confirm_callback
-    cancel_button.callback = cancel_callback
-
-    view.add_item(
-        confirm_button
-    )
-
-    view.add_item(
-        cancel_button
-    )
-
-    # --------------------------------------------------------
-    # CONFIRMATION MESSAGE
-    # --------------------------------------------------------
-
-    await ctx.response.send_message(
-        f"⚠️ **Profile Reset Confirmation**\n\n"
-        f"You are about to completely reset "
-        f"{member.mention}'s competitive profile.\n\n"
-        f"This will reset:\n"
-        f"• Duelist ELO/stats\n"
-        f"• Soldier ELO/stats\n"
-        f"• Aether Wielder ELO/stats\n"
-        f"• Wins and losses\n"
-        f"• Current streaks\n"
-        f"• Peak ELO\n"
-        f"• All tier roles\n\n"
-        f"The player will be returned to **Unranked**.\n\n"
-        f"Are you sure?",
-        view=view,
-        ephemeral=True
-    )
-        # ----------------------------------------------------
-        # REMOVE ALL TIER ROLES AND GIVE UNRANKED
-        # ----------------------------------------------------
-
-        for category in CATEGORY_ROLES:
-
-            role_ids = TIER_ROLE_IDS[
-                category
-            ]
-
-
-            for tier_name, role_id in role_ids.items():
-
-                role = ctx.guild.get_role(
-                    role_id
-                )
-
-
-                if role is None:
-
-                    continue
-
-
-                if role in member.roles:
-
-                    try:
-
-                        await member.remove_roles(
-                            role
-                        )
-
-                    except discord.HTTPException as error:
-
-                        role_errors += 1
-
-                        print(
-                            f"Could not remove {role.name} "
-                            f"from {member}: {error}"
-                        )
-
-
-            unranked_role = ctx.guild.get_role(
-                role_ids["Unranked"]
-            )
-
-
-            if (
-                unranked_role
-                and
-                unranked_role not in member.roles
-            ):
-
-                try:
-
-                    await member.add_roles(
-                        unranked_role
-                    )
-
-                except discord.HTTPException as error:
-
-                    role_errors += 1
-
-                    print(
-                        f"Could not add {unranked_role.name} "
-                        f"to {member}: {error}"
-                    )
-
-
-            # ------------------------------------------------
-            # AUDIT RESET
-            # ------------------------------------------------
-
-            audit(
-                member.id,
-                category,
-                old_elos[category],
-                400,
-                "PROFILE RESET",
-                None,
-                ctx.user.id
-            )
-
-
-        # ----------------------------------------------------
-        # LOG RESET
-        # ----------------------------------------------------
-
-        reset_embed = discord.Embed(
-            title="Profile Reset",
-            description=(
-                f"**User:** {member.mention}\n"
-                f"**Reset by:** {ctx.user.mention}\n\n"
+                f"**Reset by:** "
+                f"{ctx.user.mention}\n\n"
 
                 f"**Duelist:** "
                 f"{old_elos['Duelist']} → 400\n"
@@ -2767,76 +2168,65 @@ async def profile_reset(
             )
         )
 
-
         logs = await get_logs_channel()
 
-
         if logs:
-
             await logs.send(
                 embed=reset_embed
             )
 
-
-        # ----------------------------------------------------
-        # DISABLE BUTTONS
-        # ----------------------------------------------------
-
         confirm_button.disabled = True
         cancel_button.disabled = True
 
+        message = (
+            f"Profile for {member.mention} "
+            f"has been reset.\n\n"
+
+            f"All categories are now "
+            f"**400 ELO** and **Unranked**.\n"
+
+            f"Wins, losses, streaks and "
+            f"peak ELO were reset.\n"
+
+            f"Previous match history remains "
+            f"stored but is hidden from the "
+            f"reset profile."
+        )
 
         if role_errors:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All ELO/stats were reset to **400/0**.\n"
-                f"Old match history remains stored but is hidden "
-                f"from the reset profile.\n\n"
-                f"⚠️ {role_errors} role update(s) failed. "
-                f"Check the bot's role hierarchy."
+            message += (
+                f"\n\n⚠️ {role_errors} role "
+                f"update(s) failed. Check the "
+                f"bot's role hierarchy."
             )
-
-        else:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All categories are now **400 ELO** and **Unranked**.\n"
-                f"Wins, losses, streaks and peak ELO were reset.\n"
-                f"Previous match history remains stored but is hidden "
-                f"from the reset profile."
-            )
-
 
         await interaction.response.edit_message(
-            content=result_text,
+            content=message,
             view=view
         )
 
-
         view.stop()
-
 
     async def cancel_callback(
         interaction
     ):
-
         confirm_button.disabled = True
         cancel_button.disabled = True
-
 
         await interaction.response.edit_message(
             content="Profile reset cancelled.",
             view=view
         )
 
-
         view.stop()
 
+    confirm_button.callback = (
+        confirm_callback
+    )
 
-    confirm_button.callback = confirm_callback
-    cancel_button.callback = cancel_callback
-
+    cancel_button.callback = (
+        cancel_callback
+    )
 
     view.add_item(
         confirm_button
@@ -2846,15 +2236,12 @@ async def profile_reset(
         cancel_button
     )
 
-
-    # --------------------------------------------------------
-    # CONFIRMATION MESSAGE
-    # --------------------------------------------------------
-
     await ctx.response.send_message(
         f"⚠️ **Profile Reset Confirmation**\n\n"
+
         f"You are about to completely reset "
         f"{member.mention}'s competitive profile.\n\n"
+
         f"This will reset:\n"
         f"• Duelist ELO/stats\n"
         f"• Soldier ELO/stats\n"
@@ -2863,212 +2250,12 @@ async def profile_reset(
         f"• Current streaks\n"
         f"• Peak ELO\n"
         f"• All tier roles\n\n"
-        f"The player will be returned to **Unranked**.\n\n"
+
+        f"The player will be returned to "
+        f"**Unranked**.\n\n"
+
         f"Are you sure?",
-        view=view,
-        ephemeral=True
-    )
-        # ----------------------------------------------------
-        # REMOVE ALL TIER ROLES AND GIVE UNRANKED
-        # ----------------------------------------------------
 
-        role_errors = 0
-
-
-        for category in CATEGORY_ROLES:
-
-            role_ids = TIER_ROLE_IDS[
-                category
-            ]
-
-
-            for tier_name, role_id in role_ids.items():
-
-                role = ctx.guild.get_role(
-                    role_id
-                )
-
-
-                if role is None:
-
-                    continue
-
-
-                if role in member.roles:
-
-                    try:
-
-                        await member.remove_roles(
-                            role
-                        )
-
-                    except discord.HTTPException as error:
-
-                        role_errors += 1
-
-                        print(
-                            f"Could not remove {role.name} "
-                            f"from {member}: {error}"
-                        )
-
-
-            unranked_role = ctx.guild.get_role(
-                role_ids["Unranked"]
-            )
-
-
-            if (
-                unranked_role
-                and
-                unranked_role not in member.roles
-            ):
-
-                try:
-
-                    await member.add_roles(
-                        unranked_role
-                    )
-
-                except discord.HTTPException as error:
-
-                    role_errors += 1
-
-                    print(
-                        f"Could not add {unranked_role.name} "
-                        f"to {member}: {error}"
-                    )
-
-
-            # ------------------------------------------------
-            # AUDIT RESET
-            # ------------------------------------------------
-
-            audit(
-                member.id,
-                category,
-                old_elos[category],
-                400,
-                "PROFILE RESET",
-                None,
-                ctx.user.id
-            )
-
-
-        # ----------------------------------------------------
-        # LOG
-        # ----------------------------------------------------
-
-        reset_embed = discord.Embed(
-            title="Profile Reset",
-            description=(
-                f"**User:** {member.mention}\n"
-                f"**Reset by:** {ctx.user.mention}\n\n"
-
-                f"**Duelist:** "
-                f"{old_elos['Duelist']} → 400\n"
-
-                f"**Soldier:** "
-                f"{old_elos['Soldier']} → 400\n"
-
-                f"**Aether Wielder:** "
-                f"{old_elos['Aether Wielder']} → 400"
-            )
-        )
-
-
-        logs = await get_logs_channel()
-
-
-        if logs:
-
-            await logs.send(
-                embed=reset_embed
-            )
-
-
-        # ----------------------------------------------------
-        # DISABLE BUTTONS
-        # ----------------------------------------------------
-
-        confirm_button.disabled = True
-        cancel_button.disabled = True
-
-
-        if role_errors:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All ELO/stats were reset to **400/0**.\n"
-                f"Old match history remains stored but is hidden "
-                f"from the reset profile.\n\n"
-                f"⚠️ {role_errors} role update(s) failed. "
-                f"Check the bot's role hierarchy."
-            )
-
-        else:
-
-            result_text = (
-                f"Profile for {member.mention} has been reset.\n\n"
-                f"All categories are now **400 ELO** and **Unranked**.\n"
-                f"Wins, losses, streaks and peak ELO were reset.\n"
-                f"Previous match history remains stored but is hidden "
-                f"from the reset profile."
-            )
-
-
-        await interaction.response.edit_message(
-            content=result_text,
-            view=view
-        )
-
-
-        view.stop()
-
-
-    async def cancel_callback(
-        interaction
-    ):
-
-        confirm_button.disabled = True
-        cancel_button.disabled = True
-
-
-        await interaction.response.edit_message(
-            content="Profile reset cancelled.",
-            view=view
-        )
-
-
-        view.stop()
-
-
-    confirm_button.callback = confirm_callback
-    cancel_button.callback = cancel_callback
-
-
-    view.add_item(
-        confirm_button
-    )
-
-    view.add_item(
-        cancel_button
-    )
-
-
-    await ctx.response.send_message(
-        f"⚠️ **Profile Reset Confirmation**\n\n"
-        f"You are about to completely reset "
-        f"{member.mention}'s competitive profile.\n\n"
-        f"This will reset:\n"
-        f"• Duelist ELO/stats\n"
-        f"• Soldier ELO/stats\n"
-        f"• Aether Wielder ELO/stats\n"
-        f"• Wins and losses\n"
-        f"• Current streaks\n"
-        f"• Peak ELO\n"
-        f"• All tier roles\n\n"
-        f"The player will be returned to **Unranked**.\n\n"
-        f"Are you sure?",
         view=view,
         ephemeral=True
     )
@@ -3081,41 +2268,43 @@ async def profile_reset(
 @tree.command(
     name="match_history",
     description="Show a player's recent matches.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user.",
     category="Optional category."
 )
-
 async def match_history(
     ctx,
-    member: Optional[discord.Member] = None,
-    category: Optional[str] = None
+    member: Optional[
+        discord.Member
+    ] = None,
+    category: Optional[
+        str
+    ] = None
 ):
-
-    member = member or ctx.user
-
+    member = (
+        member
+        or
+        ctx.user
+    )
 
     if (
-        category is not None
+        category
         and
         category not in CATEGORY_ROLES
     ):
-
         await ctx.response.send_message(
             "Invalid category.",
             ephemeral=True
         )
-
         return
-
 
     reset = get_profile_reset(
         member.id
     )
-
 
     reset_time = (
         reset["reset_at"]
@@ -3123,132 +2312,96 @@ async def match_history(
         else None
     )
 
-
     if category:
-
-        rows = db_execute(
-            """
+        rows = db_execute("""
             SELECT *
-
             FROM Matches
-
             WHERE category = ?
-
             AND undone = 0
-
             AND (
                 winner_id = ?
-                OR
-                loser_id = ?
+                OR loser_id = ?
             )
-
             AND (
                 ? IS NULL
-                OR
-                created_at > ?
+                OR created_at > ?
             )
-
             ORDER BY id DESC
-
             LIMIT 10
-            """,
-            (
-                category,
-                member.id,
-                member.id,
-                reset_time,
-                reset_time
-            ),
-            fetchall=True
-        )
-
+        """, (
+            category,
+            member.id,
+            member.id,
+            reset_time,
+            reset_time
+        ), fetchall=True)
 
     else:
-
-        rows = db_execute(
-            """
+        rows = db_execute("""
             SELECT *
-
             FROM Matches
-
             WHERE undone = 0
-
             AND (
                 winner_id = ?
-                OR
-                loser_id = ?
+                OR loser_id = ?
             )
-
             AND (
                 ? IS NULL
-                OR
-                created_at > ?
+                OR created_at > ?
             )
-
             ORDER BY id DESC
-
             LIMIT 10
-            """,
-            (
-                member.id,
-                member.id,
-                reset_time,
-                reset_time
-            ),
-            fetchall=True
-        )
-
+        """, (
+            member.id,
+            member.id,
+            reset_time,
+            reset_time
+        ), fetchall=True)
 
     if not rows:
-
         await ctx.response.send_message(
             "No match history found."
         )
-
         return
-
 
     lines = []
 
-
     for row in rows:
-
         is_winner = (
             row["winner_id"]
             ==
             member.id
         )
 
-
         if is_winner:
+            opponent = row[
+                "loser_id"
+            ]
 
-            opponent = row["loser_id"]
+            before = row[
+                "winner_elo_before"
+            ]
 
-            before = (
-                row["winner_elo_before"]
-            )
-
-            after = (
-                row["winner_elo_after"]
-            )
+            after = row[
+                "winner_elo_after"
+            ]
 
             result = "WIN"
 
-
         else:
+            opponent = row[
+                "winner_id"
+            ]
 
-            opponent = row["winner_id"]
+            before = row[
+                "loser_elo_before"
+            ]
 
-            before = (
-                row["loser_elo_before"]
-            )
-
-            after = (
-                row["loser_elo_after"]
-            )
+            after = row[
+                "loser_elo_after"
+            ]
 
             result = "LOSS"
-
 
         lines.append(
             f"**{row['match_code']}** • "
@@ -3258,9 +2411,9 @@ async def match_history(
             f"{before} → {after}"
         )
 
-
     await ctx.response.send_message(
-        f"**{member.display_name}'s Match History**\n\n"
+        f"**{member.display_name}'s "
+        f"Match History**\n\n"
         +
         "\n".join(lines)
     )
@@ -3273,288 +2426,209 @@ async def match_history(
 @tree.command(
     name="elo_undo",
     description="Undo a match.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     match_code="The match ID, e.g. DUEL-00001."
 )
-
 async def elo_undo(
     ctx,
     match_code: str
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
 
-
-    match_code = match_code.upper().strip()
-
-
-    row = db_execute(
-        """
-        SELECT *
-
-        FROM Matches
-
-        WHERE match_code = ?
-        """,
-        (
-            match_code,
-        ),
-        fetchone=True
+    match_code = (
+        match_code
+        .upper()
+        .strip()
     )
 
+    row = db_execute("""
+        SELECT *
+        FROM Matches
+        WHERE match_code = ?
+    """, (
+        match_code
+    ), fetchone=True)
 
     if row is None:
-
         await ctx.response.send_message(
             "Match not found.",
             ephemeral=True
         )
-
         return
 
-
     if row["undone"]:
-
         await ctx.response.send_message(
             "That match has already been undone.",
             ephemeral=True
         )
-
         return
-
-
-    # --------------------------------------------------------
-    # PROFILE RESET PROTECTION
-    # --------------------------------------------------------
 
     winner_reset = get_profile_reset(
         row["winner_id"]
     )
 
-
     loser_reset = get_profile_reset(
         row["loser_id"]
     )
 
-
     if (
         winner_reset
         and
-        row["created_at"] <= winner_reset["reset_at"]
+        row["created_at"]
+        <=
+        winner_reset["reset_at"]
     ):
-
         await ctx.response.send_message(
-            "That match occurred before the winner's "
-            "profile reset and cannot be undone.",
+            "That match occurred before the "
+            "winner's profile reset and "
+            "cannot be undone.",
             ephemeral=True
         )
-
         return
-
 
     if (
         loser_reset
         and
-        row["created_at"] <= loser_reset["reset_at"]
+        row["created_at"]
+        <=
+        loser_reset["reset_at"]
     ):
-
         await ctx.response.send_message(
-            "That match occurred before the loser's "
-            "profile reset and cannot be undone.",
+            "That match occurred before the "
+            "loser's profile reset and "
+            "cannot be undone.",
             ephemeral=True
         )
-
         return
 
-
-    # --------------------------------------------------------
-    # ONLY ALLOW UNDOING THE MOST RECENT MATCH INVOLVING
-    # EITHER PLAYER IN THAT CATEGORY.
-    # --------------------------------------------------------
-
-    latest = db_execute(
-        """
+    latest = db_execute("""
         SELECT id
-
         FROM Matches
-
         WHERE category = ?
-
         AND undone = 0
-
         AND (
             winner_id IN (?, ?)
             OR
             loser_id IN (?, ?)
         )
-
         ORDER BY id DESC
-
         LIMIT 1
-        """,
-        (
-            row["category"],
-
-            row["winner_id"],
-            row["loser_id"],
-
-            row["winner_id"],
-            row["loser_id"]
-        ),
-        fetchone=True
-    )
-
+    """, (
+        row["category"],
+        row["winner_id"],
+        row["loser_id"],
+        row["winner_id"],
+        row["loser_id"]
+    ), fetchone=True)
 
     if (
         latest is None
         or
         latest["id"] != row["id"]
     ):
-
         await ctx.response.send_message(
-            "Only the most recent match involving either "
-            "player in that category can be undone.",
+            "Only the most recent match "
+            "involving either player in "
+            "that category can be undone.",
             ephemeral=True
         )
-
         return
 
-
-    # --------------------------------------------------------
-    # RESTORE WINNER
-    # --------------------------------------------------------
-
     update_stats(
         row["winner_id"],
         row["category"],
-
-        elo=row["winner_elo_before"],
-
-        wins=row["winner_wins_before"],
-
-        losses=row["winner_losses_before"],
-
-        streak=row["winner_streak_before"],
-
-        peak=row["winner_elo_before"]
+        elo=row[
+            "winner_elo_before"
+        ],
+        wins=row[
+            "winner_wins_before"
+        ],
+        losses=row[
+            "winner_losses_before"
+        ],
+        streak=row[
+            "winner_streak_before"
+        ]
     )
-
-
-    # --------------------------------------------------------
-    # RESTORE LOSER
-    # --------------------------------------------------------
 
     update_stats(
         row["loser_id"],
         row["category"],
-
-        elo=row["loser_elo_before"],
-
-        wins=row["loser_wins_before"],
-
-        losses=row["loser_losses_before"],
-
-        streak=row["loser_streak_before"],
-
-        peak=row["loser_elo_before"]
+        elo=row[
+            "loser_elo_before"
+        ],
+        wins=row[
+            "loser_wins_before"
+        ],
+        losses=row[
+            "loser_losses_before"
+        ],
+        streak=row[
+            "loser_streak_before"
+        ]
     )
 
-
-    # --------------------------------------------------------
-    # MARK MATCH AS UNDONE
-    # --------------------------------------------------------
-
-    db_execute(
-        """
+    db_execute("""
         UPDATE Matches
-
         SET undone = 1
-
         WHERE id = ?
-        """,
-        (
-            row["id"],
-        ),
-        commit=True
-    )
-
-
-    # --------------------------------------------------------
-    # AUDIT
-    # --------------------------------------------------------
+    """, (
+        row["id"],
+    ), commit=True)
 
     audit(
         row["winner_id"],
         row["category"],
-
         row["winner_elo_after"],
         row["winner_elo_before"],
-
         "MATCH UNDO",
-
         row["match_code"],
-
         ctx.user.id
     )
-
 
     audit(
         row["loser_id"],
         row["category"],
-
         row["loser_elo_after"],
         row["loser_elo_before"],
-
         "MATCH UNDO",
-
         row["match_code"],
-
         ctx.user.id
     )
-
-
-    # --------------------------------------------------------
-    # UPDATE ROLES
-    # --------------------------------------------------------
 
     winner = ctx.guild.get_member(
         row["winner_id"]
     )
 
-
     loser = ctx.guild.get_member(
         row["loser_id"]
     )
 
-
     if winner:
-
         await update_category_role(
             ctx.guild,
             winner,
             row["category"]
         )
 
-
     if loser:
-
         await update_category_role(
             ctx.guild,
             loser,
             row["category"]
         )
 
-
     await ctx.response.send_message(
-        f"Match **{row['match_code']}** has been undone."
+        f"Match **{row['match_code']}** "
+        f"has been undone."
     )
 
 
@@ -3565,15 +2639,15 @@ async def elo_undo(
 @tree.command(
     name="rank_set",
     description="Manually assign SS or SSS.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user.",
     category="The category.",
     rank="The manual rank."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES,
 
@@ -3589,67 +2663,61 @@ async def elo_undo(
         )
     ]
 )
-
 async def rank_set(
     ctx,
     member: discord.Member,
     category: str,
     rank: str
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
-
 
     role_ids = TIER_ROLE_IDS[
         category
     ]
 
-
-    for other_rank in (
-        "SS-Tier",
-        "SSS-Tier"
-    ):
-
+    # Remove every tier role first.
+    for role_id in role_ids.values():
         role = ctx.guild.get_role(
-            role_ids[other_rank]
+            role_id
         )
-
 
         if (
             role
             and
             role in member.roles
         ):
-
-            await member.remove_roles(
-                role
-            )
-
+            try:
+                await member.remove_roles(
+                    role
+                )
+            except discord.HTTPException:
+                pass
 
     target_role = ctx.guild.get_role(
         role_ids[rank]
     )
 
-
     if target_role is None:
-
         await ctx.response.send_message(
             "That tier role could not be found.",
             ephemeral=True
         )
-
         return
 
-
-    await member.add_roles(
-        target_role
-    )
-
+    try:
+        await member.add_roles(
+            target_role
+        )
+    except discord.HTTPException as error:
+        await ctx.response.send_message(
+            f"Could not assign the role: {error}",
+            ephemeral=True
+        )
+        return
 
     await ctx.response.send_message(
         f"{member.mention} is now "
@@ -3664,57 +2732,51 @@ async def rank_set(
 @tree.command(
     name="rank_remove",
     description="Remove a manual SS or SSS rank.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user.",
     category="The category."
 )
-
 @app_commands.choices(
     category=CATEGORY_CHOICES
 )
-
 async def rank_remove(
     ctx,
     member: discord.Member,
     category: str
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
-
 
     role_ids = TIER_ROLE_IDS[
         category
     ]
 
-
     for rank in (
         "SS-Tier",
         "SSS-Tier"
     ):
-
         role = ctx.guild.get_role(
             role_ids[rank]
         )
-
 
         if (
             role
             and
             role in member.roles
         ):
-
-            await member.remove_roles(
-                role
-            )
-
+            try:
+                await member.remove_roles(
+                    role
+                )
+            except discord.HTTPException:
+                pass
 
     automatic_rank = await update_category_role(
         ctx.guild,
@@ -3722,11 +2784,11 @@ async def rank_remove(
         category
     )
 
-
     await ctx.response.send_message(
-        f"Removed the manual SS/SSS rank from "
-        f"{member.mention}.\n"
-        f"Automatic rank: **{automatic_rank}**"
+        f"Removed the manual SS/SSS rank "
+        f"from {member.mention}.\n"
+        f"Automatic rank: "
+        f"**{automatic_rank}**"
     )
 
 
@@ -3737,40 +2799,37 @@ async def rank_remove(
 @tree.command(
     name="update_user",
     description="Update all category roles for a user.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     member="The user."
 )
-
 async def update_user(
     ctx,
     member: discord.Member
 ):
-
     if not has_staff_permission(
         ctx.user
     ):
-
         await deny(ctx)
         return
-
 
     ranks = await update_all_roles(
         ctx.guild,
         member
     )
 
-
     result = " | ".join(
         f"{category}: **{rank}**"
-        for category, rank in ranks.items()
+        for category, rank
+        in ranks.items()
     )
 
-
     await ctx.response.send_message(
-        f"Updated {member.mention}:\n{result}"
+        f"Updated {member.mention}:\n"
+        f"{result}"
     )
 
 
@@ -3781,44 +2840,36 @@ async def update_user(
 @tree.command(
     name="say",
     description="Make the bot send a message.",
-    guild=discord.Object(id=SERVER_ID)
+    guild=discord.Object(
+        id=SERVER_ID
+    )
 )
-
 @app_commands.describe(
     message="The message you want the bot to send."
 )
-
 async def say(
     ctx,
     message: str
 ):
-
     required_role = ctx.guild.get_role(
         SAY_ROLE_ID
     )
 
-
     if required_role is None:
-
         await ctx.response.send_message(
             "The required /say role could not be found.",
             ephemeral=True
         )
-
         return
-
 
     if required_role not in ctx.user.roles:
-
         await deny(ctx)
         return
-
 
     await ctx.response.send_message(
         "Message sent.",
         ephemeral=True
     )
-
 
     await ctx.channel.send(
         message
@@ -3831,27 +2882,21 @@ async def say(
 
 @client.event
 async def on_message(message):
-
     if message.author.bot:
-
         return
-
 
     if (
         message.author.id
         ==
         1286730886074597389
-
         and
-
         message.content == "say it"
     ):
-
-        logs_channel = await get_logs_channel()
-
+        logs_channel = (
+            await get_logs_channel()
+        )
 
         if logs_channel:
-
             await logs_channel.send(
                 "soup is the GOAT!!!!! :fire:"
             )
@@ -3862,28 +2907,21 @@ async def on_message(message):
 # ============================================================
 
 def backup_database():
-
     try:
-
         source = Path(
             "duelist.db"
         )
 
-
         if not source.exists():
-
             return
-
 
         backup_directory = Path(
             "backups"
         )
 
-
         backup_directory.mkdir(
             exist_ok=True
         )
-
 
         destination = (
             backup_directory
@@ -3891,22 +2929,19 @@ def backup_database():
             "duelist_latest.db"
         )
 
-
         shutil.copy2(
             source,
             destination
         )
 
-
         print(
             "Database backup created."
         )
 
-
     except OSError as error:
-
         print(
-            f"Database backup failed: {error}"
+            f"Database backup failed: "
+            f"{error}"
         )
 
 
@@ -3919,11 +2954,12 @@ app = Flask(__name__)
 
 @app.route(
     "/",
-    methods=["GET", "HEAD"]
+    methods=[
+        "GET",
+        "HEAD"
+    ]
 )
-
 def home():
-
     return (
         "Bot is running!",
         200
@@ -3931,14 +2967,12 @@ def home():
 
 
 def run_flask():
-
     port = int(
         os.environ.get(
             "PORT",
             8080
         )
     )
-
 
     app.run(
         host="0.0.0.0",
@@ -3953,14 +2987,12 @@ def run_flask():
 # ============================================================
 
 if not TOKEN:
-
     raise RuntimeError(
         "TOKEN environment variable is not set."
     )
 
 
 create_database()
-
 
 backup_database()
 
@@ -3971,6 +3003,4 @@ threading.Thread(
 ).start()
 
 
-client.run(
-    TOKEN
-)
+client.run(TOKEN)
